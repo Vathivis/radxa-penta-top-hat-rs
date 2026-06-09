@@ -1,0 +1,17 @@
+[package]
+name = "radxa-penta-top-hat-rs"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Low-memory Rust control daemon for the Radxa Penta SATA HAT top board"
+
+[dependencies]
+
+[dev-dependencies]
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
