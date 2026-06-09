@@ -6,6 +6,7 @@ use radxa_penta_top_hat_rs::cli::Args;
 use radxa_penta_top_hat_rs::config::Config;
 use radxa_penta_top_hat_rs::env_file::PinMap;
 use radxa_penta_top_hat_rs::fan::FanDecision;
+use radxa_penta_top_hat_rs::pwm::{Duty, FanOutput, FanPwmOutput};
 use radxa_penta_top_hat_rs::temp::read_cpu_temp_c;
 
 fn main() {
@@ -35,6 +36,10 @@ fn run() -> Result<(), String> {
         );
     }
 
+    if let Some(percent) = args.test_fan_duty {
+        return run_fan_test(&args, &pin_map, percent);
+    }
+
     loop {
         let temp_c = read_cpu_temp_c(&args.cpu_temp_path).map_err(|err| err.to_string())?;
         let decision = FanDecision::cpu_only(temp_c, config.fan);
@@ -52,6 +57,27 @@ fn run() -> Result<(), String> {
 
         thread::sleep(Duration::from_secs(1));
     }
+}
+
+fn run_fan_test(args: &Args, pin_map: &PinMap, percent: u8) -> Result<(), String> {
+    if args.dry_run {
+        println!(
+            "dry-run: would set fan duty to {} percent for {} seconds",
+            percent, args.test_fan_seconds
+        );
+        return Ok(());
+    }
+
+    let mut output = FanOutput::open_from_pin_map(pin_map).map_err(|err| err.to_string())?;
+    output
+        .set_logical_duty(Duty::from_percent(percent))
+        .map_err(|err| err.to_string())?;
+    thread::sleep(Duration::from_secs(args.test_fan_seconds));
+    output
+        .set_logical_duty(Duty::from_percent(0))
+        .map_err(|err| err.to_string())?;
+
+    Ok(())
 }
 
 fn usage() -> String {

@@ -14,6 +14,8 @@ pub struct Args {
     pub dry_run: bool,
     pub once: bool,
     pub help: bool,
+    pub test_fan_duty: Option<u8>,
+    pub test_fan_seconds: u64,
 }
 
 impl Default for Args {
@@ -25,6 +27,8 @@ impl Default for Args {
             dry_run: false,
             once: false,
             help: false,
+            test_fan_duty: None,
+            test_fan_seconds: 10,
         }
     }
 }
@@ -66,6 +70,16 @@ impl Args {
                 parsed.cpu_temp_path = PathBuf::from(value);
             } else if arg == "--cpu-temp-path" {
                 parsed.cpu_temp_path = next_path(&mut iter, "--cpu-temp-path")?;
+            } else if let Some(value) = arg.strip_prefix("--test-fan-duty=") {
+                parsed.test_fan_duty = Some(parse_percent(value, "--test-fan-duty")?);
+            } else if arg == "--test-fan-duty" {
+                let value = next_string(&mut iter, "--test-fan-duty")?;
+                parsed.test_fan_duty = Some(parse_percent(&value, "--test-fan-duty")?);
+            } else if let Some(value) = arg.strip_prefix("--test-fan-seconds=") {
+                parsed.test_fan_seconds = parse_seconds(value, "--test-fan-seconds")?;
+            } else if arg == "--test-fan-seconds" {
+                let value = next_string(&mut iter, "--test-fan-seconds")?;
+                parsed.test_fan_seconds = parse_seconds(&value, "--test-fan-seconds")?;
             } else {
                 return Err(format!("unknown argument: {arg}"));
             }
@@ -79,6 +93,13 @@ fn next_path<I>(iter: &mut I, flag: &str) -> Result<PathBuf, String>
 where
     I: Iterator<Item = OsString>,
 {
+    Ok(PathBuf::from(next_string(iter, flag)?))
+}
+
+fn next_string<I>(iter: &mut I, flag: &str) -> Result<String, String>
+where
+    I: Iterator<Item = OsString>,
+{
     let value = iter
         .next()
         .ok_or_else(|| format!("{flag} requires a value"))?
@@ -89,7 +110,31 @@ where
         return Err(format!("{flag} value must not be empty"));
     }
 
-    Ok(PathBuf::from(value))
+    Ok(value)
+}
+
+fn parse_percent(value: &str, flag: &str) -> Result<u8, String> {
+    let percent = value
+        .parse::<u8>()
+        .map_err(|_| format!("{flag} must be an integer from 0 to 100"))?;
+
+    if percent > 100 {
+        return Err(format!("{flag} must be an integer from 0 to 100"));
+    }
+
+    Ok(percent)
+}
+
+fn parse_seconds(value: &str, flag: &str) -> Result<u64, String> {
+    let seconds = value
+        .parse::<u64>()
+        .map_err(|_| format!("{flag} must be a positive integer"))?;
+
+    if seconds == 0 {
+        return Err(format!("{flag} must be greater than zero"));
+    }
+
+    Ok(seconds)
 }
 
 pub fn usage(program: &str) -> String {
@@ -103,6 +148,8 @@ Options:
       --cpu-temp-path <PATH>  CPU temp path [default: {DEFAULT_CPU_TEMP_PATH}]
       --dry-run               Print fan decisions without hardware output
       --once                  Take one sample and exit
+      --test-fan-duty <0-100> Set fan duty for a bounded manual test
+      --test-fan-seconds <N>  Manual fan test duration [default: 10]
   -h, --help                  Show this help
 "
     )
@@ -120,6 +167,8 @@ mod tests {
         assert_eq!(args.cpu_temp_path, PathBuf::from(DEFAULT_CPU_TEMP_PATH));
         assert!(!args.dry_run);
         assert!(!args.once);
+        assert_eq!(args.test_fan_duty, None);
+        assert_eq!(args.test_fan_seconds, 10);
     }
 
     #[test]
@@ -133,6 +182,9 @@ mod tests {
             "/tmp/temp",
             "--dry-run",
             "--once",
+            "--test-fan-duty",
+            "25",
+            "--test-fan-seconds=3",
         ])
         .expect("explicit args should parse");
 
@@ -141,5 +193,15 @@ mod tests {
         assert_eq!(args.cpu_temp_path, PathBuf::from("/tmp/temp"));
         assert!(args.dry_run);
         assert!(args.once);
+        assert_eq!(args.test_fan_duty, Some(25));
+        assert_eq!(args.test_fan_seconds, 3);
+    }
+
+    #[test]
+    fn rejects_invalid_fan_test_duty() {
+        let err = Args::parse_from(["daemon", "--test-fan-duty", "101"])
+            .expect_err("invalid percent should fail");
+
+        assert!(err.contains("--test-fan-duty"));
     }
 }

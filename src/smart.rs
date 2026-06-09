@@ -75,6 +75,8 @@ fn parse_json_ata_temperature_attribute(input: &str) -> Option<DriveTemperature>
 }
 
 fn parse_text_temperature(output: &str) -> Option<DriveTemperature> {
+    let mut best_attribute_temperature: Option<DriveTemperature> = None;
+
     for line in output.lines() {
         let trimmed = line.trim();
         let lower = trimmed.to_ascii_lowercase();
@@ -101,14 +103,21 @@ fn parse_text_temperature(output: &str) -> Option<DriveTemperature> {
         if is_temperature_attribute_line(&lower)
             && let Some(current_celsius) = smart_attribute_raw_value(trimmed)
         {
-            return Some(DriveTemperature {
+            let candidate = DriveTemperature {
                 current_celsius,
                 source: SmartTemperatureSource::TextAttribute,
-            });
+            };
+
+            if best_attribute_temperature
+                .map(|best| candidate.current_celsius > best.current_celsius)
+                .unwrap_or(true)
+            {
+                best_attribute_temperature = Some(candidate);
+            }
         }
     }
 
-    None
+    best_attribute_temperature
 }
 
 fn is_temperature_attribute_name(name: &str) -> bool {
@@ -341,6 +350,39 @@ ID# ATTRIBUTE_NAME          FLAG     VALUE WORST THRESH TYPE      UPDATED  WHEN_
             parse_smart_temperature(output),
             Some(DriveTemperature {
                 current_celsius: 35,
+                source: SmartTemperatureSource::TextAttribute,
+            })
+        );
+    }
+
+    #[test]
+    fn ignores_non_temperature_attributes_from_real_seagate_output() {
+        let output = r#"
+  7 Seek_Error_Rate         0x000f   083   060   045    Pre-fail  Always       -       194264277
+190 Airflow_Temperature_Cel 0x0022   056   054   040    Old_age   Always       -       44 (Min/Max 36/46)
+194 Temperature_Celsius     0x0022   044   046   000    Old_age   Always       -       44 (0 20 0 0 0)
+"#;
+
+        assert_eq!(
+            parse_smart_temperature(output),
+            Some(DriveTemperature {
+                current_celsius: 44,
+                source: SmartTemperatureSource::TextAttribute,
+            })
+        );
+    }
+
+    #[test]
+    fn uses_highest_temperature_when_text_attributes_disagree() {
+        let output = r#"
+190 Airflow_Temperature_Cel 0x0022   059   056   040    Old_age   Always       -       41 (Min/Max 34/44)
+194 Temperature_Celsius     0x0022   044   046   000    Old_age   Always       -       44 (0 20 0 0 0)
+"#;
+
+        assert_eq!(
+            parse_smart_temperature(output),
+            Some(DriveTemperature {
+                current_celsius: 44,
                 source: SmartTemperatureSource::TextAttribute,
             })
         );
