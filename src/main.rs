@@ -1,20 +1,12 @@
-#![deny(unsafe_code)]
-
-mod cli;
-mod config;
-mod env_file;
-mod fan;
-mod temp;
-
 use std::env;
 use std::thread;
 use std::time::Duration;
 
-use cli::Args;
-use config::Config;
-use env_file::PinMap;
-use fan::FanDecision;
-use temp::read_cpu_temp_c;
+use radxa_penta_top_hat_rs::cli::Args;
+use radxa_penta_top_hat_rs::config::Config;
+use radxa_penta_top_hat_rs::env_file::PinMap;
+use radxa_penta_top_hat_rs::fan::FanDecision;
+use radxa_penta_top_hat_rs::temp::read_cpu_temp_c;
 
 fn main() {
     if let Err(err) = run() {
@@ -66,5 +58,5 @@ fn usage() -> String {
     let program = env::args()
         .next()
         .unwrap_or_else(|| "radxa-penta-top-hat-rs".to_string());
-    cli::usage(&program)
+    radxa_penta_top_hat_rs::cli::usage(&program)
 }
