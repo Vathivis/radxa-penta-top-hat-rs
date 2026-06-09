@@ -2,3 +2,5 @@
 *.profraw
 *.profdata
 /.env
+/plan.md
+/scripts/

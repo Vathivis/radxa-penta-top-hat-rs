@@ -124,10 +124,10 @@ impl Config {
             config.oled.sleep = parse_f64(section, "sleep", config.oled.sleep)?;
         }
 
-        if let Some(section) = ini.get("disk") {
-            if let Some(extra) = section.get("extra") {
-                config.disks = split_csv(extra);
-            }
+        if let Some(section) = ini.get("disk")
+            && let Some(extra) = section.get("extra")
+        {
+            config.disks = split_csv(extra);
         }
 
         Ok(config)
