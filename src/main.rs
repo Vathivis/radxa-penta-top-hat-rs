@@ -50,10 +50,7 @@ fn run() -> Result<(), String> {
         if args.dry_run || args.once {
             println!(
                 "cpu_temp_c={:.1} fan_level={:?} duty_percent={} active_low_duty={:.2}",
-                decision.temp_c,
-                decision.level,
-                decision.duty_percent,
-                decision.active_low_duty
+                decision.temp_c, decision.level, decision.duty_percent, decision.active_low_duty
             );
         }
 

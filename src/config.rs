@@ -3,7 +3,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Config {
     pub fan: FanConfig,
     pub key: KeyConfig,
@@ -40,18 +40,6 @@ pub struct OledConfig {
     pub auto_slide: bool,
     pub auto_slide_time: f64,
     pub sleep: f64,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            fan: FanConfig::default(),
-            key: KeyConfig::default(),
-            time: TimeConfig::default(),
-            oled: OledConfig::default(),
-            disks: Vec::new(),
-        }
-    }
 }
 
 impl Default for FanConfig {
@@ -282,12 +270,17 @@ impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(err) => write!(f, "config I/O error: {err}"),
-            Self::Parse { line, message } => write!(f, "config parse error on line {line}: {message}"),
+            Self::Parse { line, message } => {
+                write!(f, "config parse error on line {line}: {message}")
+            }
             Self::Value {
                 key,
                 value,
                 expected,
-            } => write!(f, "invalid config value for {key}: {value:?}, expected {expected}"),
+            } => write!(
+                f,
+                "invalid config value for {key}: {value:?}, expected {expected}"
+            ),
         }
     }
 }

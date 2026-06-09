@@ -104,7 +104,9 @@ impl PinMap {
 }
 
 fn strip_comment(line: &str) -> &str {
-    line.split_once('#').map(|(prefix, _)| prefix).unwrap_or(line)
+    line.split_once('#')
+        .map(|(prefix, _)| prefix)
+        .unwrap_or(line)
 }
 
 fn unquote(value: &str) -> String {
@@ -160,7 +162,10 @@ impl std::fmt::Display for EnvFileError {
                 key,
                 value,
                 expected,
-            } => write!(f, "invalid env value for {key}: {value:?}, expected {expected}"),
+            } => write!(
+                f,
+                "invalid env value for {key}: {value:?}, expected {expected}"
+            ),
         }
     }
 }

@@ -25,7 +25,7 @@
 - [ ] Implement hardware PWM sysfs backend.
 - [ ] Implement software GPIO PWM backend for Raspberry Pi 5.
 - [x] Add dry-run and single-sample modes for host verification.
-- [ ] Verify CPU-only fan decisions on the host without touching GPIO.
+- [x] Verify CPU-only fan decisions on the host without touching GPIO.
 - [ ] Verify live fan output at low, medium, and full duty.
 - [ ] Implement button handling: click, double click, long press.
 - [ ] Implement fan on/off switch behavior.
@@ -46,12 +46,12 @@
 - [ ] Add tests for curve interpolation and max-duty selection.
 - [ ] Add systemd service packaging.
 - [ ] Add install and upgrade notes.
-- [ ] Run `cargo fmt`.
-- [ ] Run `cargo clippy --all-targets -- -D warnings`.
-- [ ] Run `cargo test`.
-- [ ] Run `cargo build --release`.
-- [ ] Verify runtime memory usage on the host.
-- [ ] Confirm no toolchain, build cache, or project artifacts land on rootfs.
+- [x] Run `cargo fmt`.
+- [x] Run `cargo clippy --all-targets -- -D warnings`.
+- [x] Run `cargo test`.
+- [x] Run `cargo build --release`.
+- [x] Verify runtime memory usage on the host.
+- [x] Confirm no toolchain, build cache, or project artifacts land on rootfs.
 
 ## Compatibility Target
 
