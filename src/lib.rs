@@ -6,5 +6,6 @@ pub mod env_file;
 pub mod fan;
 pub mod gpio_cdev;
 pub mod pwm;
+pub mod shutdown;
 pub mod smart;
 pub mod temp;

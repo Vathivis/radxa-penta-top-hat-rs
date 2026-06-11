@@ -86,6 +86,13 @@ impl FanOutput {
             Ok(Self::Software(pwm))
         }
     }
+
+    pub fn last_error(&self) -> Option<String> {
+        match self {
+            Self::Sysfs(_) => None,
+            Self::Software(pwm) => pwm.last_error(),
+        }
+    }
 }
 
 impl FanPwmOutput for FanOutput {
