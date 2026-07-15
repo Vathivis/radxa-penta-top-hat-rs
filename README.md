@@ -77,6 +77,44 @@ hysteresis = 2
 ramp_down = 5
 ```
 
+### Option reference
+
+- `[fan]`: `lv0` through `lv3` are the four strictly increasing CPU-temperature
+  inflection points in degrees Celsius. Below `lv0` the requested fan duty is
+  zero.
+- `[fan_curve]`: `enabled` selects the interpolated curve. `duty0` through
+  `duty3` are the nondecreasing fan percentages at the four temperature points.
+  `tail=hold` keeps `duty3` above the last point; `tail=extrapolate` continues
+  the final segment until `max_duty`, which is always a hard cap.
+  `hysteresis` is the downward deadband in percentage points, and `ramp_down`
+  limits decreases in percentage points per second (`0` disables the limit).
+  Temperature increases and a true zero-duty target take effect immediately.
+- `[fan_drives]`: `enabled` adds disk temperature to fan control. `devices` is
+  a comma-separated list of device paths queried with standby-safe `smartctl`;
+  `lv0` through `lv3` are their temperature points and `poll_seconds` is the
+  positive polling interval. CPU and disk control share `[fan_curve]`, and the
+  higher requested duty wins.
+- `[key]`: `click`, `twice`, and `press` assign actions to a single click,
+  double click, and long press. Actions are `slider` (wake or next OLED page),
+  `switch` (toggle fan control), `reboot`, `poweroff`, or `none`.
+- `[time]`: `twice` is the double-click window in seconds; `press` is the hold
+  time in seconds that qualifies as a long press.
+- `[oled]`: `rotate` turns the display orientation by 180 degrees; `f-temp`
+  selects Fahrenheit instead of Celsius; `auto_slide` enables automatic page
+  changes; `auto_slide_time` is the refresh/page interval in seconds; and
+  `sleep` blanks the display after that many seconds without a manual button
+  event (`0` disables blanking).
+- `[disk]`: `extra` is a comma-separated list of filesystems/devices to add to
+  the OLED usage page. The page always starts with `ROOT` and then shows up to
+  three extras. Bare names are resolved below `/dev`, so `md127,sda1` displays
+  usage for `/dev/md127` (the RAID filesystem) and `/dev/sda1` (the SSD).
+  This does not select drives for temperature monitoring; that is configured by
+  `[fan_drives].devices`.
+
+Boolean options accept `true`/`false`, `yes`/`no`, `on`/`off`, or `1`/`0`.
+With `[fan_curve]` disabled, the daemon uses the original stepped fan behavior;
+with `[fan_drives]` disabled, only CPU temperature controls the fan.
+
 Build and run:
 
 ```bash
