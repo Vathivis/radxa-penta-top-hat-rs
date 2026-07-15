@@ -1,0 +1,20 @@
+{
+  "smartctl": {
+    "exit_status": 3,
+    "messages": [
+      {
+        "string": "Device is in STANDBY mode, exit(3)",
+        "severity": "information"
+      }
+    ]
+  },
+  "device": {
+    "name": "/dev/sdc",
+    "type": "ata",
+    "protocol": "ATA"
+  },
+  "power_mode": {
+    "name": "STANDBY",
+    "value": 0
+  }
+}

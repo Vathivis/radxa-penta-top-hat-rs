@@ -7,6 +7,7 @@ pub mod env_file;
 pub mod fan;
 pub mod gpio_cdev;
 pub mod oled;
+mod oled_font;
 pub mod pwm;
 pub mod shutdown;
 pub mod smart;

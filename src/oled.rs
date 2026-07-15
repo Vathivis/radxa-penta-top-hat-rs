@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::os::raw::{c_int, c_ulong};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use crate::config::OledConfig;
 use crate::env_file::PinMap;
 use crate::gpio_cdev::GpioLine;
+use crate::oled_font::{BitmapFont, DEJAVU_SANS_MONO_11, DEJAVU_SANS_MONO_12, DEJAVU_SANS_MONO_14};
 use crate::pwm::DigitalOutput;
 use crate::shutdown;
 use crate::system::{self, STATUS_PAGE_COUNT};
@@ -44,6 +45,7 @@ impl OledRuntime {
         cpu_temp_path: PathBuf,
         disks: Vec<String>,
         slide_requested: Arc<AtomicBool>,
+        fan_percent: Arc<AtomicU8>,
     ) -> io::Result<Option<Self>> {
         if pin_map.sda.is_none() && pin_map.scl.is_none() {
             return Ok(None);
@@ -60,7 +62,14 @@ impl OledRuntime {
             .as_deref()
             .unwrap_or(DEFAULT_I2C_DEVICE);
         let mut display = Ssd1306::open(i2c_device, pin_map, config.rotate)?;
-        render_status_page(&mut display, 0, &cpu_temp_path, &disks, config.f_temp)?;
+        render_status_page(
+            &mut display,
+            0,
+            &cpu_temp_path,
+            &disks,
+            config.f_temp,
+            fan_percent.load(Ordering::SeqCst),
+        )?;
 
         let stop = Arc::new(AtomicBool::new(false));
         let last_error = Arc::new(Mutex::new(None));
@@ -74,6 +83,7 @@ impl OledRuntime {
                     &cpu_temp_path,
                     &disks,
                     slide_requested,
+                    fan_percent,
                     &stop,
                 ) {
                     store_error(&last_error, err.to_string());
@@ -114,6 +124,7 @@ fn run_oled_loop(
     cpu_temp_path: &Path,
     disks: &[String],
     slide_requested: Arc<AtomicBool>,
+    fan_percent: Arc<AtomicU8>,
     stop: &AtomicBool,
 ) -> io::Result<()> {
     let refresh_interval = refresh_interval(config.auto_slide_time);
@@ -139,7 +150,14 @@ fn run_oled_loop(
                 if wake {
                     display.set_enabled(true)?;
                 }
-                render_status_page(display, page, cpu_temp_path, disks, config.f_temp)?;
+                render_status_page(
+                    display,
+                    page,
+                    cpu_temp_path,
+                    disks,
+                    config.f_temp,
+                    fan_percent.load(Ordering::SeqCst),
+                )?;
             }
         }
 
@@ -241,9 +259,10 @@ fn render_status_page(
     cpu_temp_path: &Path,
     disks: &[String],
     fahrenheit: bool,
+    fan_percent: u8,
 ) -> io::Result<()> {
     display.framebuffer.clear();
-    let lines = system::status_page(page, cpu_temp_path, disks, fahrenheit);
+    let lines = system::status_page(page, cpu_temp_path, disks, fahrenheit, fan_percent);
     display.framebuffer.draw_status_lines(&lines);
     display.show()
 }
@@ -408,136 +427,75 @@ impl Framebuffer {
     }
 
     fn draw_status_lines(&mut self, lines: &[String]) {
-        let visible_lines = lines.len().clamp(1, 3);
-        let (glyph_width, glyph_height, advance, first_y, line_step) = match visible_lines {
-            1 => (8, 15, 9, 8, 0),
-            2 => (7, 13, 8, 1, 17),
-            _ => (6, 10, 7, 0, 11),
-        };
+        if lines.is_empty() {
+            return;
+        }
 
-        for (line_index, text) in lines.iter().take(visible_lines).enumerate() {
-            self.draw_centered_text(
-                first_y + line_index * line_step,
-                text,
-                glyph_width,
-                glyph_height,
-                advance,
-            );
+        let visible_lines = lines.len().clamp(1, 3);
+        match visible_lines {
+            1 => self.draw_centered_text(2, &lines[0], DEJAVU_SANS_MONO_14),
+            2 => {
+                self.draw_centered_text(2, &lines[0], DEJAVU_SANS_MONO_12);
+                self.draw_centered_text(18, &lines[1], DEJAVU_SANS_MONO_12);
+            }
+            _ => {
+                // These are the size and baselines used by the original
+                // Pillow-based rockpi-penta overview page.
+                for (text, y) in lines.iter().take(3).zip([-2, 10, 21]) {
+                    self.draw_centered_text(y, text, DEJAVU_SANS_MONO_11);
+                }
+            }
         }
     }
 
-    fn draw_centered_text(
-        &mut self,
-        y: usize,
-        text: &str,
-        glyph_width: usize,
-        glyph_height: usize,
-        advance: usize,
-    ) {
-        let max_characters = (WIDTH + advance - glyph_width) / advance;
-        let characters: Vec<_> = text
+    fn draw_centered_text(&mut self, y: isize, text: &str, font: BitmapFont) {
+        let mut characters: Vec<_> = text
             .chars()
             .map(|character| character.to_ascii_uppercase())
-            .take(max_characters)
             .collect();
+        while font.text_width(characters.len()) > WIDTH {
+            characters.pop();
+        }
         if characters.is_empty() {
             return;
         }
 
-        let text_width = (characters.len() - 1) * advance + glyph_width;
-        let mut cursor_x = (WIDTH - text_width) / 2;
-        for character in characters {
-            self.draw_scaled_glyph(cursor_x, y, character, glyph_width, glyph_height);
-            cursor_x += advance;
+        let text_width = font.text_width(characters.len());
+        let start_x = (WIDTH - text_width) / 2;
+        for (index, character) in characters.into_iter().enumerate() {
+            self.draw_bitmap_glyph(
+                start_x + font.character_x(index),
+                y,
+                character,
+                font,
+                font.phase_index(index),
+            );
         }
     }
 
-    fn draw_scaled_glyph(
+    fn draw_bitmap_glyph(
         &mut self,
         x: usize,
-        y: usize,
+        y: isize,
         character: char,
-        glyph_width: usize,
-        glyph_height: usize,
+        font: BitmapFont,
+        phase_index: usize,
     ) {
-        let source = glyph(character);
-        for target_x in 0..glyph_width {
-            let source_x = target_x * 5 / glyph_width;
-            let bits = source[source_x];
-            for target_y in 0..glyph_height {
-                let source_y = target_y * 7 / glyph_height;
-                if bits & (1 << source_y) != 0 {
-                    self.set_pixel(x + target_x, y + target_y);
-                }
-            }
-        }
-    }
-
-    #[cfg(test)]
-    fn draw_unscaled_text(&mut self, x: usize, y: usize, text: &str) {
-        let mut cursor_x = x;
-        for character in text.chars().map(|character| character.to_ascii_uppercase()) {
-            if cursor_x + 5 > WIDTH {
-                break;
-            }
-            for (column, bits) in glyph(character).iter().enumerate() {
-                for row in 0..7 {
-                    if bits & (1 << row) != 0 {
-                        self.set_pixel(cursor_x + column, y + row);
+        for (column, bits) in font
+            .glyph(character, phase_index)
+            .iter()
+            .take(font.glyph_width)
+            .enumerate()
+        {
+            for row in 0..u16::BITS as usize {
+                if bits & (1 << row) != 0 {
+                    let target_y = y + row as isize;
+                    if target_y >= 0 {
+                        self.set_pixel(x + column, target_y as usize);
                     }
                 }
             }
-            cursor_x += 6;
         }
-    }
-}
-
-fn glyph(character: char) -> [u8; 5] {
-    match character {
-        ' ' => [0x00, 0x00, 0x00, 0x00, 0x00],
-        '0' => [0x3e, 0x51, 0x49, 0x45, 0x3e],
-        '1' => [0x00, 0x42, 0x7f, 0x40, 0x00],
-        '2' => [0x42, 0x61, 0x51, 0x49, 0x46],
-        '3' => [0x21, 0x41, 0x45, 0x4b, 0x31],
-        '4' => [0x18, 0x14, 0x12, 0x7f, 0x10],
-        '5' => [0x27, 0x45, 0x45, 0x45, 0x39],
-        '6' => [0x3c, 0x4a, 0x49, 0x49, 0x30],
-        '7' => [0x01, 0x71, 0x09, 0x05, 0x03],
-        '8' => [0x36, 0x49, 0x49, 0x49, 0x36],
-        '9' => [0x06, 0x49, 0x49, 0x29, 0x1e],
-        'A' => [0x7e, 0x11, 0x11, 0x11, 0x7e],
-        'B' => [0x7f, 0x49, 0x49, 0x49, 0x36],
-        'C' => [0x3e, 0x41, 0x41, 0x41, 0x22],
-        'D' => [0x7f, 0x41, 0x41, 0x22, 0x1c],
-        'E' => [0x7f, 0x49, 0x49, 0x49, 0x41],
-        'F' => [0x7f, 0x09, 0x09, 0x09, 0x01],
-        'G' => [0x3e, 0x41, 0x49, 0x49, 0x7a],
-        'H' => [0x7f, 0x08, 0x08, 0x08, 0x7f],
-        'I' => [0x00, 0x41, 0x7f, 0x41, 0x00],
-        'J' => [0x20, 0x40, 0x41, 0x3f, 0x01],
-        'K' => [0x7f, 0x08, 0x14, 0x22, 0x41],
-        'L' => [0x7f, 0x40, 0x40, 0x40, 0x40],
-        'M' => [0x7f, 0x02, 0x0c, 0x02, 0x7f],
-        'N' => [0x7f, 0x04, 0x08, 0x10, 0x7f],
-        'O' => [0x3e, 0x41, 0x41, 0x41, 0x3e],
-        'P' => [0x7f, 0x09, 0x09, 0x09, 0x06],
-        'Q' => [0x3e, 0x41, 0x51, 0x21, 0x5e],
-        'R' => [0x7f, 0x09, 0x19, 0x29, 0x46],
-        'S' => [0x46, 0x49, 0x49, 0x49, 0x31],
-        'T' => [0x01, 0x01, 0x7f, 0x01, 0x01],
-        'U' => [0x3f, 0x40, 0x40, 0x40, 0x3f],
-        'V' => [0x1f, 0x20, 0x40, 0x20, 0x1f],
-        'W' => [0x3f, 0x40, 0x38, 0x40, 0x3f],
-        'X' => [0x63, 0x14, 0x08, 0x14, 0x63],
-        'Y' => [0x07, 0x08, 0x70, 0x08, 0x07],
-        'Z' => [0x61, 0x51, 0x49, 0x45, 0x43],
-        '.' => [0x00, 0x60, 0x60, 0x00, 0x00],
-        ':' => [0x00, 0x36, 0x36, 0x00, 0x00],
-        '/' => [0x20, 0x10, 0x08, 0x04, 0x02],
-        '%' => [0x23, 0x13, 0x08, 0x64, 0x62],
-        '-' => [0x08, 0x08, 0x08, 0x08, 0x08],
-        '_' => [0x40, 0x40, 0x40, 0x40, 0x40],
-        _ => [0x02, 0x01, 0x51, 0x09, 0x06],
     }
 }
 
@@ -621,15 +579,46 @@ mod tests {
     #[test]
     fn text_rendering_clips_at_display_width() {
         let mut framebuffer = Framebuffer::default();
-        framebuffer.draw_unscaled_text(126, 0, "ABC");
+        framebuffer.draw_centered_text(0, &"A".repeat(100), DEJAVU_SANS_MONO_11);
+        assert!(framebuffer.bytes.iter().any(|byte| *byte != 0));
+    }
+
+    #[test]
+    fn empty_status_page_is_a_no_op() {
+        let mut framebuffer = Framebuffer::default();
+        framebuffer.draw_status_lines(&[]);
         assert!(framebuffer.bytes.iter().all(|byte| *byte == 0));
     }
 
     #[test]
     fn text_rendering_draws_known_glyph() {
         let mut framebuffer = Framebuffer::default();
-        framebuffer.draw_unscaled_text(0, 0, "A");
-        assert_eq!(&framebuffer.bytes[..5], &[0x7e, 0x11, 0x11, 0x11, 0x7e]);
+        framebuffer.draw_bitmap_glyph(0, 0, 'A', DEJAVU_SANS_MONO_11, 0);
+        assert_eq!(
+            &framebuffer.bytes[..7],
+            &[0x00, 0x00, 0xc0, 0x38, 0x38, 0xc0, 0x00]
+        );
+    }
+
+    #[test]
+    fn original_size_font_fits_full_temperature_and_fan_line() {
+        let line = "CPU 122.0F FAN 100%";
+        assert_eq!(DEJAVU_SANS_MONO_11.text_width(line.chars().count()), 126);
+        assert!(DEJAVU_SANS_MONO_11.text_width(line.chars().count()) <= WIDTH);
+    }
+
+    #[test]
+    fn size_11_raster_matches_legacy_pillow_output() {
+        let mut framebuffer = Framebuffer::default();
+        framebuffer.draw_centered_text(10, "CPU 122.0F FAN 100%", DEJAVU_SANS_MONO_11);
+
+        let hash = framebuffer
+            .bytes
+            .iter()
+            .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+            });
+        assert_eq!(hash, 0x7507_9cc2_08cc_c9aa);
     }
 
     #[test]

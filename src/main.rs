@@ -1,17 +1,18 @@
 use std::env;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use radxa_penta_top_hat_rs::button::ButtonRuntime;
 use radxa_penta_top_hat_rs::cli::Args;
 use radxa_penta_top_hat_rs::config::Config;
 use radxa_penta_top_hat_rs::env_file::PinMap;
-use radxa_penta_top_hat_rs::fan::FanDecision;
+use radxa_penta_top_hat_rs::fan::{FanDecision, FanLevel, level_for_temperature};
 use radxa_penta_top_hat_rs::oled::OledRuntime;
 use radxa_penta_top_hat_rs::pwm::{Duty, FanOutput, FanPwmOutput};
 use radxa_penta_top_hat_rs::shutdown;
+use radxa_penta_top_hat_rs::smart::{DriveTemperatureFailure, poll_drive_temperatures};
 use radxa_penta_top_hat_rs::temp::read_cpu_temp_c;
 
 fn main() {
@@ -53,6 +54,12 @@ fn run() -> Result<(), String> {
     };
     let mut last_duty_percent = None;
     let fan_enabled = Arc::new(AtomicBool::new(true));
+    let initial_fan_percent = FanDecision::cpu_only(
+        read_cpu_temp_c(&args.cpu_temp_path).map_err(|err| err.to_string())?,
+        config.fan,
+    )
+    .duty_percent;
+    let fan_percent = Arc::new(AtomicU8::new(initial_fan_percent));
     let slide_requested = Arc::new(AtomicBool::new(false));
     let oled_runtime = if args.dry_run || args.once {
         None
@@ -63,6 +70,7 @@ fn run() -> Result<(), String> {
             args.cpu_temp_path.clone(),
             config.disks.clone(),
             Arc::clone(&slide_requested),
+            Arc::clone(&fan_percent),
         ) {
             Ok(runtime) => {
                 if runtime.is_some() {
@@ -90,33 +98,142 @@ fn run() -> Result<(), String> {
         )
         .map_err(|err| err.to_string())?
     };
+    let drive_polling_enabled = config.fan_drives.enabled && !config.fan_drives.devices.is_empty();
+    let drive_poll_interval = Duration::from_secs(config.fan_drives.poll_seconds);
+    let mut last_drive_poll = None;
+    let mut hottest_drive_temp_c = None;
+    let mut last_drive_log_state: Option<(
+        Option<FanLevel>,
+        Vec<String>,
+        Vec<DriveTemperatureFailure>,
+    )> = None;
+
+    if config.fan_drives.enabled {
+        if config.fan_drives.devices.is_empty() {
+            eprintln!(
+                "fan-drives: enabled but no devices are configured; using CPU temperature only"
+            );
+        } else {
+            eprintln!(
+                "fan-drives: enabled devices={} poll_seconds={}",
+                config.fan_drives.devices.join(","),
+                config.fan_drives.poll_seconds
+            );
+        }
+    }
 
     while !shutdown::requested() {
-        let temp_c = read_cpu_temp_c(&args.cpu_temp_path).map_err(|err| err.to_string())?;
-        let decision = FanDecision::cpu_only(temp_c, config.fan);
-        let commanded_duty_percent = if fan_enabled.load(Ordering::SeqCst) {
-            decision.duty_percent
-        } else {
-            0
-        };
+        let mut temp_c = read_cpu_temp_c(&args.cpu_temp_path).map_err(|err| err.to_string())?;
+        let mut decision = FanDecision::from_temperatures(
+            temp_c,
+            config.fan,
+            hottest_drive_temp_c,
+            config.fan_drives.thresholds,
+        );
+        let mut commanded_duty_percent = commanded_duty(&decision, &fan_enabled);
+        fan_percent.store(commanded_duty_percent, Ordering::SeqCst);
+
+        // Establish a CPU-safe duty before the first, potentially slower, SMART batch.
+        if let Some(output) = output.as_mut()
+            && apply_changed_duty(output, commanded_duty_percent, &mut last_duty_percent)?
+        {
+            log_fan_change(&decision, commanded_duty_percent, &fan_enabled);
+        }
+
+        let mut polled_drives = false;
+        if drive_polling_enabled
+            && last_drive_poll
+                .map(|last: Instant| last.elapsed() >= drive_poll_interval)
+                .unwrap_or(true)
+        {
+            let poll = poll_drive_temperatures(&config.fan_drives.devices);
+            last_drive_poll = Some(Instant::now());
+            polled_drives = true;
+
+            hottest_drive_temp_c = poll
+                .hottest()
+                .map(|reading| f64::from(reading.temperature.current_celsius));
+            let drive_level = hottest_drive_temp_c
+                .map(|temp_c| level_for_temperature(temp_c, config.fan_drives.thresholds));
+            let log_state = (
+                drive_level,
+                poll.standby_devices.clone(),
+                poll.failures.clone(),
+            );
+
+            if last_drive_log_state.as_ref() != Some(&log_state) {
+                for failure in &poll.failures {
+                    eprintln!(
+                        "fan-drives: device={} read failed: {}",
+                        failure.device, failure.error
+                    );
+                }
+
+                if let Some(hottest) = poll.hottest() {
+                    let readings = poll
+                        .readings
+                        .iter()
+                        .map(|reading| {
+                            format!(
+                                "{}={}C",
+                                reading.device, reading.temperature.current_celsius
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    eprintln!(
+                        "fan-drives: readings={} standby={} failed={} hottest_device={} hottest_temp_c={} drive_level={:?}",
+                        readings,
+                        poll.standby_devices.len(),
+                        poll.failures.len(),
+                        hottest.device,
+                        hottest.temperature.current_celsius,
+                        drive_level
+                    );
+                } else if poll.failures.is_empty() {
+                    eprintln!(
+                        "fan-drives: all configured drives are in standby; using CPU temperature only"
+                    );
+                } else {
+                    eprintln!(
+                        "fan-drives: no configured drive temperatures available; using CPU temperature only"
+                    );
+                }
+
+                last_drive_log_state = Some(log_state);
+            }
+        }
+
+        if polled_drives {
+            temp_c = read_cpu_temp_c(&args.cpu_temp_path).map_err(|err| err.to_string())?;
+        }
+
+        decision = FanDecision::from_temperatures(
+            temp_c,
+            config.fan,
+            hottest_drive_temp_c,
+            config.fan_drives.thresholds,
+        );
+        commanded_duty_percent = commanded_duty(&decision, &fan_enabled);
+        fan_percent.store(commanded_duty_percent, Ordering::SeqCst);
 
         if args.dry_run || args.once {
             println!(
-                "cpu_temp_c={:.1} fan_level={:?} duty_percent={} active_low_duty={:.2}",
-                decision.temp_c, decision.level, decision.duty_percent, decision.active_low_duty
+                "cpu_temp_c={:.1} cpu_level={:?} hottest_drive_temp_c={:?} drive_level={:?} fan_level={:?} duty_percent={} active_low_duty={:.2}",
+                decision.cpu_temp_c,
+                decision.cpu_level,
+                decision.hottest_drive_temp_c,
+                decision.drive_level,
+                decision.level,
+                decision.duty_percent,
+                decision.active_low_duty
             );
         }
 
         if let Some(output) = output.as_mut()
             && apply_changed_duty(output, commanded_duty_percent, &mut last_duty_percent)?
         {
-            eprintln!(
-                "fan: cpu_temp_c={:.1} fan_level={:?} duty_percent={} enabled={}",
-                decision.temp_c,
-                decision.level,
-                commanded_duty_percent,
-                fan_enabled.load(Ordering::SeqCst)
-            );
+            log_fan_change(&decision, commanded_duty_percent, &fan_enabled);
         }
 
         if args.once {
@@ -139,6 +256,7 @@ fn run() -> Result<(), String> {
     }
 
     if let Some(output) = output.as_mut() {
+        fan_percent.store(0, Ordering::SeqCst);
         output
             .set_logical_duty(Duty::from_percent(0))
             .map_err(|err| err.to_string())?;
@@ -146,6 +264,27 @@ fn run() -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn commanded_duty(decision: &FanDecision, fan_enabled: &AtomicBool) -> u8 {
+    if fan_enabled.load(Ordering::SeqCst) {
+        decision.duty_percent
+    } else {
+        0
+    }
+}
+
+fn log_fan_change(decision: &FanDecision, commanded_duty_percent: u8, fan_enabled: &AtomicBool) {
+    eprintln!(
+        "fan: cpu_temp_c={:.1} cpu_level={:?} hottest_drive_temp_c={:?} drive_level={:?} fan_level={:?} duty_percent={} enabled={}",
+        decision.cpu_temp_c,
+        decision.cpu_level,
+        decision.hottest_drive_temp_c,
+        decision.drive_level,
+        decision.level,
+        commanded_duty_percent,
+        fan_enabled.load(Ordering::SeqCst)
+    );
 }
 
 fn apply_changed_duty<O>(
@@ -214,15 +353,6 @@ mod tests {
         }
     }
 
-    fn decision(duty_percent: u8) -> FanDecision {
-        FanDecision {
-            temp_c: 0.0,
-            level: radxa_penta_top_hat_rs::fan::FanLevel::Off,
-            duty_percent,
-            active_low_duty: 1.0,
-        }
-    }
-
     #[test]
     fn applies_first_duty() {
         let mut output = RecordingOutput::default();
@@ -248,12 +378,16 @@ mod tests {
     #[test]
     fn fan_disabled_commands_zero_duty() {
         let fan_enabled = AtomicBool::new(false);
-        let computed = decision(75);
-        let commanded = if fan_enabled.load(Ordering::SeqCst) {
-            computed.duty_percent
-        } else {
-            0
-        };
+        let computed = FanDecision::cpu_only(
+            55.0,
+            radxa_penta_top_hat_rs::config::FanConfig {
+                lv0: 40.0,
+                lv1: 45.0,
+                lv2: 50.0,
+                lv3: 60.0,
+            },
+        );
+        let commanded = commanded_duty(&computed, &fan_enabled);
 
         assert_eq!(commanded, 0);
     }

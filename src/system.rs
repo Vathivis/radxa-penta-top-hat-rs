@@ -12,18 +12,19 @@ pub fn status_page(
     cpu_temp_path: &Path,
     disks: &[String],
     fahrenheit: bool,
+    fan_percent: u8,
 ) -> Vec<String> {
     match index % STATUS_PAGE_COUNT {
-        0 => overview_page(cpu_temp_path, fahrenheit),
+        0 => overview_page(cpu_temp_path, fahrenheit, fan_percent),
         1 => resource_page(),
         _ => disk_page(disks),
     }
 }
 
-fn overview_page(cpu_temp_path: &Path, fahrenheit: bool) -> Vec<String> {
+fn overview_page(cpu_temp_path: &Path, fahrenheit: bool, fan_percent: u8) -> Vec<String> {
     vec![
         format_uptime(read_uptime_seconds()),
-        format_temperature(read_cpu_temp_c(cpu_temp_path).ok(), fahrenheit),
+        format_temperature_and_fan(read_cpu_temp_c(cpu_temp_path).ok(), fahrenheit, fan_percent),
         format!("IP {}", primary_ipv4().unwrap_or_else(|| "--".to_string())),
     ]
 }
@@ -111,15 +112,16 @@ fn format_uptime(seconds: Option<u64>) -> String {
     }
 }
 
-fn format_temperature(celsius: Option<f64>, fahrenheit: bool) -> String {
+fn format_temperature_and_fan(celsius: Option<f64>, fahrenheit: bool, fan_percent: u8) -> String {
+    let fan_percent = fan_percent.min(100);
     let Some(celsius) = celsius else {
-        return "CPU --".to_string();
+        return format!("CPU -- FAN {fan_percent}%");
     };
 
     if fahrenheit {
-        format!("CPU {:.1}F", celsius * 1.8 + 32.0)
+        format!("CPU {:.1}F FAN {fan_percent}%", celsius * 1.8 + 32.0)
     } else {
-        format!("CPU {celsius:.1}C")
+        format!("CPU {celsius:.1}C FAN {fan_percent}%")
     }
 }
 
@@ -177,9 +179,25 @@ mod tests {
     }
 
     #[test]
-    fn formats_temperature_in_configured_unit() {
-        assert_eq!(format_temperature(Some(50.0), false), "CPU 50.0C");
-        assert_eq!(format_temperature(Some(50.0), true), "CPU 122.0F");
+    fn formats_temperature_and_fan_in_configured_unit() {
+        let celsius = format_temperature_and_fan(Some(50.0), false, 75);
+        let fahrenheit = format_temperature_and_fan(Some(50.0), true, 100);
+
+        assert_eq!(celsius, "CPU 50.0C FAN 75%");
+        assert_eq!(fahrenheit, "CPU 122.0F FAN 100%");
+        assert_eq!(fahrenheit.chars().count(), 19);
+        assert_eq!(
+            format_temperature_and_fan(None, false, 25),
+            "CPU -- FAN 25%"
+        );
+    }
+
+    #[test]
+    fn clamps_displayed_fan_percent() {
+        assert_eq!(
+            format_temperature_and_fan(Some(50.0), false, 255),
+            "CPU 50.0C FAN 100%"
+        );
     }
 
     #[test]

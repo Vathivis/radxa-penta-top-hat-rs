@@ -1,0 +1,33 @@
+{
+  "smartctl": {
+    "exit_status": 8
+  },
+  "device": {
+    "name": "/dev/sdd",
+    "type": "sat",
+    "protocol": "ATA"
+  },
+  "ata_smart_attributes": {
+    "table": [
+      {
+        "id": 190,
+        "name": "Airflow_Temperature_Cel",
+        "raw": {
+          "value": 841023534,
+          "string": "46 (Min/Max 33/50)"
+        }
+      },
+      {
+        "id": 194,
+        "name": "Temperature_Celsius",
+        "raw": {
+          "value": 85899345966,
+          "string": "46 (0 20 0 0 0)"
+        }
+      }
+    ]
+  },
+  "temperature": {
+    "current": 46
+  }
+}

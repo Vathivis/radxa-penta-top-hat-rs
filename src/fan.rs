@@ -41,7 +41,10 @@ pub fn level_for_temperature(temp_c: f64, config: FanConfig) -> FanLevel {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FanDecision {
-    pub temp_c: f64,
+    pub cpu_temp_c: f64,
+    pub hottest_drive_temp_c: Option<f64>,
+    pub cpu_level: FanLevel,
+    pub drive_level: Option<FanLevel>,
     pub level: FanLevel,
     pub duty_percent: u8,
     pub active_low_duty: f64,
@@ -49,9 +52,25 @@ pub struct FanDecision {
 
 impl FanDecision {
     pub fn cpu_only(temp_c: f64, config: FanConfig) -> Self {
-        let level = level_for_temperature(temp_c, config);
+        Self::from_temperatures(temp_c, config, None, config)
+    }
+
+    pub fn from_temperatures(
+        cpu_temp_c: f64,
+        cpu_config: FanConfig,
+        hottest_drive_temp_c: Option<f64>,
+        drive_config: FanConfig,
+    ) -> Self {
+        let cpu_level = level_for_temperature(cpu_temp_c, cpu_config);
+        let drive_level =
+            hottest_drive_temp_c.map(|temp_c| level_for_temperature(temp_c, drive_config));
+        let level = cpu_level.max(drive_level.unwrap_or(FanLevel::Off));
+
         Self {
-            temp_c,
+            cpu_temp_c,
+            hottest_drive_temp_c,
+            cpu_level,
+            drive_level,
             level,
             duty_percent: level.duty_percent(),
             active_low_duty: level.active_low_duty(),
@@ -89,5 +108,46 @@ mod tests {
         assert_eq!(FanLevel::Lv1.active_low_duty(), 0.5);
         assert_eq!(FanLevel::Lv2.active_low_duty(), 0.25);
         assert_eq!(FanLevel::Lv3.active_low_duty(), 0.0);
+    }
+
+    #[test]
+    fn drive_level_can_raise_final_fan_level() {
+        let drive_config = FanConfig {
+            lv0: 45.0,
+            lv1: 50.0,
+            lv2: 55.0,
+            lv3: 60.0,
+        };
+        let decision = FanDecision::from_temperatures(50.0, CONFIG, Some(55.0), drive_config);
+
+        assert_eq!(decision.cpu_level, FanLevel::Off);
+        assert_eq!(decision.drive_level, Some(FanLevel::Lv2));
+        assert_eq!(decision.level, FanLevel::Lv2);
+        assert_eq!(decision.duty_percent, 75);
+    }
+
+    #[test]
+    fn cpu_level_wins_when_it_is_higher() {
+        let drive_config = FanConfig {
+            lv0: 45.0,
+            lv1: 50.0,
+            lv2: 55.0,
+            lv3: 60.0,
+        };
+        let decision = FanDecision::from_temperatures(70.0, CONFIG, Some(46.0), drive_config);
+
+        assert_eq!(decision.cpu_level, FanLevel::Lv2);
+        assert_eq!(decision.drive_level, Some(FanLevel::Lv0));
+        assert_eq!(decision.level, FanLevel::Lv2);
+    }
+
+    #[test]
+    fn missing_drive_temperature_preserves_cpu_only_behavior() {
+        let decision = FanDecision::from_temperatures(62.0, CONFIG, None, CONFIG);
+
+        assert_eq!(decision.cpu_level, FanLevel::Lv1);
+        assert_eq!(decision.drive_level, None);
+        assert_eq!(decision.level, FanLevel::Lv1);
+        assert_eq!(decision.duty_percent, 50);
     }
 }

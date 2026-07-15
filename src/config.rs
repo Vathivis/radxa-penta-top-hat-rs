@@ -6,6 +6,7 @@ use std::path::Path;
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Config {
     pub fan: FanConfig,
+    pub fan_drives: FanDrivesConfig,
     pub key: KeyConfig,
     pub time: TimeConfig,
     pub oled: OledConfig,
@@ -18,6 +19,14 @@ pub struct FanConfig {
     pub lv1: f64,
     pub lv2: f64,
     pub lv3: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FanDrivesConfig {
+    pub enabled: bool,
+    pub devices: Vec<String>,
+    pub thresholds: FanConfig,
+    pub poll_seconds: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +58,22 @@ impl Default for FanConfig {
             lv1: 40.0,
             lv2: 45.0,
             lv3: 50.0,
+        }
+    }
+}
+
+impl Default for FanDrivesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            devices: Vec::new(),
+            thresholds: FanConfig {
+                lv0: 45.0,
+                lv1: 50.0,
+                lv2: 55.0,
+                lv3: 60.0,
+            },
+            poll_seconds: 30,
         }
     }
 }
@@ -104,6 +129,23 @@ impl Config {
             config.fan.lv3 = parse_f64(section, "lv3", config.fan.lv3)?;
         }
 
+        if let Some(section) = ini.get("fan_drives") {
+            config.fan_drives.enabled = parse_bool(section, "enabled", config.fan_drives.enabled)?;
+            if let Some(devices) = section.get("devices") {
+                config.fan_drives.devices = split_csv(devices);
+            }
+            config.fan_drives.thresholds.lv0 =
+                parse_f64(section, "lv0", config.fan_drives.thresholds.lv0)?;
+            config.fan_drives.thresholds.lv1 =
+                parse_f64(section, "lv1", config.fan_drives.thresholds.lv1)?;
+            config.fan_drives.thresholds.lv2 =
+                parse_f64(section, "lv2", config.fan_drives.thresholds.lv2)?;
+            config.fan_drives.thresholds.lv3 =
+                parse_f64(section, "lv3", config.fan_drives.thresholds.lv3)?;
+            config.fan_drives.poll_seconds =
+                parse_positive_u64(section, "poll_seconds", config.fan_drives.poll_seconds)?;
+        }
+
         if let Some(section) = ini.get("key") {
             config.key.click = get_string(section, "click", &config.key.click);
             config.key.twice = get_string(section, "twice", &config.key.twice);
@@ -129,6 +171,9 @@ impl Config {
         {
             config.disks = split_csv(extra);
         }
+
+        validate_fan_thresholds("fan", config.fan)?;
+        validate_fan_thresholds("fan_drives", config.fan_drives.thresholds)?;
 
         Ok(config)
     }
@@ -235,6 +280,33 @@ fn parse_bool(section: &Section, key: &str, default: bool) -> Result<bool, Confi
     }
 }
 
+fn parse_positive_u64(section: &Section, key: &str, default: u64) -> Result<u64, ConfigError> {
+    let Some(value) = section.get(key) else {
+        return Ok(default);
+    };
+
+    match value.parse::<u64>() {
+        Ok(value) if value > 0 => Ok(value),
+        _ => Err(ConfigError::Value {
+            key: key.to_string(),
+            value: value.clone(),
+            expected: "positive integer",
+        }),
+    }
+}
+
+fn validate_fan_thresholds(section: &'static str, config: FanConfig) -> Result<(), ConfigError> {
+    let values = [config.lv0, config.lv1, config.lv2, config.lv3];
+    let finite = values.iter().all(|value| value.is_finite());
+    let ascending = values.windows(2).all(|pair| pair[0] < pair[1]);
+
+    if finite && ascending {
+        Ok(())
+    } else {
+        Err(ConfigError::Thresholds { section })
+    }
+}
+
 fn get_string(section: &Section, key: &str, default: &str) -> String {
     section
         .get(key)
@@ -264,6 +336,9 @@ pub enum ConfigError {
         value: String,
         expected: &'static str,
     },
+    Thresholds {
+        section: &'static str,
+    },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -280,6 +355,10 @@ impl std::fmt::Display for ConfigError {
             } => write!(
                 f,
                 "invalid config value for {key}: {value:?}, expected {expected}"
+            ),
+            Self::Thresholds { section } => write!(
+                f,
+                "invalid [{section}] thresholds: lv0 through lv3 must be finite and strictly ascending"
             ),
         }
     }
@@ -303,6 +382,18 @@ mod tests {
                 lv3: 50.0,
             }
         );
+        assert!(!config.fan_drives.enabled);
+        assert!(config.fan_drives.devices.is_empty());
+        assert_eq!(
+            config.fan_drives.thresholds,
+            FanConfig {
+                lv0: 45.0,
+                lv1: 50.0,
+                lv2: 55.0,
+                lv3: 60.0,
+            }
+        );
+        assert_eq!(config.fan_drives.poll_seconds, 30);
         assert_eq!(config.key.click, "slider");
         assert_eq!(config.key.twice, "switch");
         assert_eq!(config.key.press, "none");
@@ -352,5 +443,74 @@ mod tests {
         assert!(!config.oled.auto_slide);
         assert_eq!(config.oled.sleep, 60.0);
         assert_eq!(config.disks, vec!["sdc1".to_string(), "sdd1".to_string()]);
+    }
+
+    #[test]
+    fn parses_explicit_drive_fan_config() {
+        let config = Config::parse(
+            r#"
+            [fan_drives]
+            enabled = true
+            devices = /dev/sdc, /dev/sdd, /dev/sde, /dev/sdf
+            lv0 = 45
+            lv1 = 50
+            lv2 = 55
+            lv3 = 60
+            poll_seconds = 45
+            "#,
+        )
+        .expect("drive fan config should parse");
+
+        assert!(config.fan_drives.enabled);
+        assert_eq!(
+            config.fan_drives.devices,
+            vec!["/dev/sdc", "/dev/sdd", "/dev/sde", "/dev/sdf"]
+        );
+        assert_eq!(config.fan_drives.thresholds.lv0, 45.0);
+        assert_eq!(config.fan_drives.thresholds.lv3, 60.0);
+        assert_eq!(config.fan_drives.poll_seconds, 45);
+    }
+
+    #[test]
+    fn rejects_zero_drive_poll_interval() {
+        let err = Config::parse(
+            r#"
+            [fan_drives]
+            poll_seconds = 0
+            "#,
+        )
+        .expect_err("zero poll interval should fail");
+
+        assert!(err.to_string().contains("poll_seconds"));
+        assert!(err.to_string().contains("positive integer"));
+    }
+
+    #[test]
+    fn rejects_non_finite_cpu_threshold() {
+        let err = Config::parse(
+            r#"
+            [fan]
+            lv0 = NaN
+            "#,
+        )
+        .expect_err("NaN threshold should fail");
+
+        assert!(err.to_string().contains("[fan] thresholds"));
+    }
+
+    #[test]
+    fn rejects_unordered_drive_thresholds() {
+        let err = Config::parse(
+            r#"
+            [fan_drives]
+            lv0 = 45
+            lv1 = 55
+            lv2 = 50
+            lv3 = 60
+            "#,
+        )
+        .expect_err("unordered thresholds should fail");
+
+        assert!(err.to_string().contains("[fan_drives] thresholds"));
     }
 }
