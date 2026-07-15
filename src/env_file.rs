@@ -8,6 +8,7 @@ pub struct PinMap {
     pub sda: Option<String>,
     pub scl: Option<String>,
     pub oled_reset: Option<String>,
+    pub oled_i2c_device: Option<String>,
     pub button_chip: Option<String>,
     pub button_line: Option<u32>,
     pub fan_chip: Option<String>,
@@ -31,6 +32,7 @@ impl PinMap {
             sda: None,
             scl: None,
             oled_reset: None,
+            oled_i2c_device: None,
             button_chip: None,
             button_line: None,
             fan_chip: None,
@@ -92,6 +94,10 @@ impl PinMap {
             sda: raw.get("SDA").cloned(),
             scl: raw.get("SCL").cloned(),
             oled_reset: raw.get("OLED_RESET").cloned(),
+            oled_i2c_device: raw
+                .get("OLED_I2C_DEVICE")
+                .or_else(|| raw.get("I2C_DEVICE"))
+                .cloned(),
             button_chip: raw.get("BUTTON_CHIP").cloned(),
             button_line,
             fan_chip: raw.get("FAN_CHIP").cloned(),
@@ -183,6 +189,7 @@ mod tests {
             SDA=SDA
             SCL=SCL
             OLED_RESET=D23
+            OLED_I2C_DEVICE=/dev/i2c-1
             BUTTON_CHIP=/dev/gpiochip4
             BUTTON_LINE=17
             FAN_CHIP=/dev/gpiochip4
@@ -193,6 +200,7 @@ mod tests {
         .expect("pin map should parse");
 
         assert_eq!(pins.sda.as_deref(), Some("SDA"));
+        assert_eq!(pins.oled_i2c_device.as_deref(), Some("/dev/i2c-1"));
         assert_eq!(pins.button_chip.as_deref(), Some("/dev/gpiochip4"));
         assert_eq!(pins.button_line, Some(17));
         assert_eq!(pins.fan_line, Some(27));
