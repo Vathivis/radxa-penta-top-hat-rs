@@ -6,14 +6,24 @@ use std::time::{Duration, Instant};
 
 use radxa_penta_top_hat_rs::button::ButtonRuntime;
 use radxa_penta_top_hat_rs::cli::Args;
-use radxa_penta_top_hat_rs::config::Config;
+use radxa_penta_top_hat_rs::config::{Config, FanCurveConfig};
 use radxa_penta_top_hat_rs::env_file::PinMap;
-use radxa_penta_top_hat_rs::fan::{FanDecision, FanLevel, level_for_temperature};
+use radxa_penta_top_hat_rs::fan::{
+    DutyStabilizer, FanDecision, FanLevel, duty_for_temperature, level_for_temperature,
+};
 use radxa_penta_top_hat_rs::oled::OledRuntime;
 use radxa_penta_top_hat_rs::pwm::{Duty, FanOutput, FanPwmOutput};
 use radxa_penta_top_hat_rs::shutdown;
 use radxa_penta_top_hat_rs::smart::{DriveTemperatureFailure, poll_drive_temperatures};
 use radxa_penta_top_hat_rs::temp::read_cpu_temp_c;
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct DriveLogState {
+    level: Option<FanLevel>,
+    duty_percent: Option<u8>,
+    standby_devices: Vec<String>,
+    failures: Vec<DriveTemperatureFailure>,
+}
 
 fn main() {
     if let Err(err) = run() {
@@ -43,6 +53,7 @@ fn run() -> Result<(), String> {
     }
 
     if let Some(percent) = args.test_fan_duty {
+        validate_test_fan_duty(percent, config.fan_curve)?;
         return run_fan_test(&args, &pin_map, percent);
     }
 
@@ -54,9 +65,10 @@ fn run() -> Result<(), String> {
     };
     let mut last_duty_percent = None;
     let fan_enabled = Arc::new(AtomicBool::new(true));
-    let initial_fan_percent = FanDecision::cpu_only(
+    let initial_fan_percent = FanDecision::cpu_only_with_curve(
         read_cpu_temp_c(&args.cpu_temp_path).map_err(|err| err.to_string())?,
         config.fan,
+        config.fan_curve,
     )
     .duty_percent;
     let fan_percent = Arc::new(AtomicU8::new(initial_fan_percent));
@@ -102,11 +114,22 @@ fn run() -> Result<(), String> {
     let drive_poll_interval = Duration::from_secs(config.fan_drives.poll_seconds);
     let mut last_drive_poll = None;
     let mut hottest_drive_temp_c = None;
-    let mut last_drive_log_state: Option<(
-        Option<FanLevel>,
-        Vec<String>,
-        Vec<DriveTemperatureFailure>,
-    )> = None;
+    let mut last_drive_log_state: Option<DriveLogState> = None;
+    let mut duty_stabilizer = DutyStabilizer::default();
+
+    if config.fan_curve.enabled {
+        eprintln!(
+            "fan-curve: enabled duties={}/{}/{}/{} tail={:?} max_duty={} hysteresis={} ramp_down={}/s",
+            config.fan_curve.duty0,
+            config.fan_curve.duty1,
+            config.fan_curve.duty2,
+            config.fan_curve.duty3,
+            config.fan_curve.tail,
+            config.fan_curve.max_duty,
+            config.fan_curve.hysteresis,
+            config.fan_curve.ramp_down
+        );
+    }
 
     if config.fan_drives.enabled {
         if config.fan_drives.devices.is_empty() {
@@ -124,13 +147,20 @@ fn run() -> Result<(), String> {
 
     while !shutdown::requested() {
         let mut temp_c = read_cpu_temp_c(&args.cpu_temp_path).map_err(|err| err.to_string())?;
-        let mut decision = FanDecision::from_temperatures(
+        let mut decision = FanDecision::from_temperatures_with_curve(
             temp_c,
             config.fan,
             hottest_drive_temp_c,
             config.fan_drives.thresholds,
+            config.fan_curve,
         );
-        let mut commanded_duty_percent = commanded_duty(&decision, &fan_enabled);
+        let mut commanded_duty_percent = commanded_duty(
+            &decision,
+            &fan_enabled,
+            config.fan_curve,
+            &mut duty_stabilizer,
+            Instant::now(),
+        );
         fan_percent.store(commanded_duty_percent, Ordering::SeqCst);
 
         // Establish a CPU-safe duty before the first, potentially slower, SMART batch.
@@ -155,11 +185,15 @@ fn run() -> Result<(), String> {
                 .map(|reading| f64::from(reading.temperature.current_celsius));
             let drive_level = hottest_drive_temp_c
                 .map(|temp_c| level_for_temperature(temp_c, config.fan_drives.thresholds));
-            let log_state = (
-                drive_level,
-                poll.standby_devices.clone(),
-                poll.failures.clone(),
-            );
+            let drive_duty = hottest_drive_temp_c.map(|temp_c| {
+                duty_for_temperature(temp_c, config.fan_drives.thresholds, config.fan_curve)
+            });
+            let log_state = DriveLogState {
+                level: drive_level,
+                duty_percent: drive_duty,
+                standby_devices: poll.standby_devices.clone(),
+                failures: poll.failures.clone(),
+            };
 
             if last_drive_log_state.as_ref() != Some(&log_state) {
                 for failure in &poll.failures {
@@ -182,13 +216,14 @@ fn run() -> Result<(), String> {
                         .collect::<Vec<_>>()
                         .join(",");
                     eprintln!(
-                        "fan-drives: readings={} standby={} failed={} hottest_device={} hottest_temp_c={} drive_level={:?}",
+                        "fan-drives: readings={} standby={} failed={} hottest_device={} hottest_temp_c={} drive_level={:?} drive_duty_percent={:?}",
                         readings,
                         poll.standby_devices.len(),
                         poll.failures.len(),
                         hottest.device,
                         hottest.temperature.current_celsius,
-                        drive_level
+                        drive_level,
+                        drive_duty
                     );
                 } else if poll.failures.is_empty() {
                     eprintln!(
@@ -208,25 +243,35 @@ fn run() -> Result<(), String> {
             temp_c = read_cpu_temp_c(&args.cpu_temp_path).map_err(|err| err.to_string())?;
         }
 
-        decision = FanDecision::from_temperatures(
+        decision = FanDecision::from_temperatures_with_curve(
             temp_c,
             config.fan,
             hottest_drive_temp_c,
             config.fan_drives.thresholds,
+            config.fan_curve,
         );
-        commanded_duty_percent = commanded_duty(&decision, &fan_enabled);
+        commanded_duty_percent = commanded_duty(
+            &decision,
+            &fan_enabled,
+            config.fan_curve,
+            &mut duty_stabilizer,
+            Instant::now(),
+        );
         fan_percent.store(commanded_duty_percent, Ordering::SeqCst);
 
         if args.dry_run || args.once {
             println!(
-                "cpu_temp_c={:.1} cpu_level={:?} hottest_drive_temp_c={:?} drive_level={:?} fan_level={:?} duty_percent={} active_low_duty={:.2}",
+                "cpu_temp_c={:.1} cpu_level={:?} cpu_duty_percent={} hottest_drive_temp_c={:?} drive_level={:?} drive_duty_percent={:?} fan_level={:?} target_duty_percent={} duty_percent={} active_low_duty={:.2}",
                 decision.cpu_temp_c,
                 decision.cpu_level,
+                decision.cpu_duty_percent,
                 decision.hottest_drive_temp_c,
                 decision.drive_level,
+                decision.drive_duty_percent,
                 decision.level,
                 decision.duty_percent,
-                decision.active_low_duty
+                commanded_duty_percent,
+                1.0 - f64::from(commanded_duty_percent) / 100.0
             );
         }
 
@@ -266,25 +311,44 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-fn commanded_duty(decision: &FanDecision, fan_enabled: &AtomicBool) -> u8 {
+fn commanded_duty(
+    decision: &FanDecision,
+    fan_enabled: &AtomicBool,
+    curve: FanCurveConfig,
+    stabilizer: &mut DutyStabilizer,
+    now: Instant,
+) -> u8 {
     if fan_enabled.load(Ordering::SeqCst) {
-        decision.duty_percent
+        stabilizer.update(decision.duty_percent, curve, now)
     } else {
-        0
+        stabilizer.force(0, curve, now)
     }
 }
 
 fn log_fan_change(decision: &FanDecision, commanded_duty_percent: u8, fan_enabled: &AtomicBool) {
     eprintln!(
-        "fan: cpu_temp_c={:.1} cpu_level={:?} hottest_drive_temp_c={:?} drive_level={:?} fan_level={:?} duty_percent={} enabled={}",
+        "fan: cpu_temp_c={:.1} cpu_level={:?} cpu_duty_percent={} hottest_drive_temp_c={:?} drive_level={:?} drive_duty_percent={:?} fan_level={:?} duty_percent={} enabled={}",
         decision.cpu_temp_c,
         decision.cpu_level,
+        decision.cpu_duty_percent,
         decision.hottest_drive_temp_c,
         decision.drive_level,
+        decision.drive_duty_percent,
         decision.level,
         commanded_duty_percent,
         fan_enabled.load(Ordering::SeqCst)
     );
+}
+
+fn validate_test_fan_duty(percent: u8, curve: FanCurveConfig) -> Result<(), String> {
+    if curve.enabled && percent > curve.max_duty {
+        Err(format!(
+            "test fan duty {percent}% exceeds configured fan-curve max_duty {}%",
+            curve.max_duty
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn apply_changed_duty<O>(
@@ -387,8 +451,28 @@ mod tests {
                 lv3: 60.0,
             },
         );
-        let commanded = commanded_duty(&computed, &fan_enabled);
+        let mut stabilizer = DutyStabilizer::default();
+        let commanded = commanded_duty(
+            &computed,
+            &fan_enabled,
+            FanCurveConfig::default(),
+            &mut stabilizer,
+            Instant::now(),
+        );
 
         assert_eq!(commanded, 0);
+    }
+
+    #[test]
+    fn fan_test_respects_enabled_curve_maximum() {
+        let curve = FanCurveConfig {
+            enabled: true,
+            max_duty: 80,
+            ..FanCurveConfig::default()
+        };
+
+        assert!(validate_test_fan_duty(80, curve).is_ok());
+        assert!(validate_test_fan_duty(81, curve).is_err());
+        assert!(validate_test_fan_duty(100, FanCurveConfig::default()).is_ok());
     }
 }
