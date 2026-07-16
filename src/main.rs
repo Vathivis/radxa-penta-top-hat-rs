@@ -7,7 +7,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use radxa_penta_top_hat_rs::button::ButtonRuntime;
-use radxa_penta_top_hat_rs::cli::Args;
+use radxa_penta_top_hat_rs::cli::{Args, version};
 use radxa_penta_top_hat_rs::config::{Config, FanCurveConfig};
 use radxa_penta_top_hat_rs::env_file::PinMap;
 use radxa_penta_top_hat_rs::fan::{
@@ -266,6 +266,11 @@ fn run() -> Result<(), String> {
 
     if args.help {
         print!("{}", usage());
+        return Ok(());
+    }
+
+    if args.version {
+        println!("{}", version());
         return Ok(());
     }
 

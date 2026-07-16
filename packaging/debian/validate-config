@@ -1,0 +1,62 @@
+#!/bin/sh
+set -eu
+
+env_file=${1:-/etc/rockpi-penta.env}
+pwm_root=${RADXA_PENTA_PWM_ROOT:-/sys/class/pwm}
+
+fail() {
+    printf 'radxa-penta-top-hat-rs: %s\n' "$*" >&2
+    exit 1
+}
+
+value() {
+    key=$1
+    sed -n "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*//p" "$env_file" \
+        | sed -n '$p' \
+        | sed 's/[[:space:]]*#.*$//; s/^['"'"']\(.*\)['"'"']$/\1/; s/^"\(.*\)"$/\1/'
+}
+
+[ -r "$env_file" ] || fail "cannot read $env_file"
+
+sda=$(value SDA)
+scl=$(value SCL)
+if [ -n "$sda" ] || [ -n "$scl" ]; then
+    [ -n "$sda" ] && [ -n "$scl" ] || fail "OLED requires both SDA and SCL"
+    i2c_device=$(value OLED_I2C_DEVICE)
+    [ -n "$i2c_device" ] || i2c_device=$(value I2C_DEVICE)
+    [ -n "$i2c_device" ] || i2c_device=/dev/i2c-1
+    [ -c "$i2c_device" ] || fail "OLED I2C device is unavailable: $i2c_device"
+fi
+
+hardware_pwm=$(value HARDWARE_PWM | tr '[:upper:]' '[:lower:]')
+case "$hardware_pwm" in
+    1|true)
+        pwmchip=$(value PWMCHIP)
+        [ -n "$pwmchip" ] || fail "HARDWARE_PWM=1 requires PWMCHIP"
+        pwmchip=${pwmchip#pwmchip}
+        [ -d "$pwm_root/pwmchip$pwmchip" ] \
+            || fail "hardware PWM device is unavailable: $pwm_root/pwmchip$pwmchip"
+        ;;
+    0|false|'')
+        fan_chip=$(value FAN_CHIP)
+        fan_line=$(value FAN_LINE)
+        [ -n "$fan_chip" ] || fail "software PWM requires FAN_CHIP"
+        [ -c "$fan_chip" ] || fail "fan GPIO device is unavailable: $fan_chip"
+        case "$fan_line" in
+            ''|*[!0-9]*) fail "software PWM requires a numeric FAN_LINE" ;;
+        esac
+        ;;
+    *) fail "HARDWARE_PWM must be 0/1 or false/true" ;;
+esac
+
+button_chip=$(value BUTTON_CHIP)
+button_line=$(value BUTTON_LINE)
+if [ -n "$button_chip" ] || [ -n "$button_line" ]; then
+    [ -n "$button_chip" ] || fail "BUTTON_LINE requires BUTTON_CHIP"
+    [ -c "$button_chip" ] || fail "button GPIO device is unavailable: $button_chip"
+    case "$button_line" in
+        ''|*[!0-9]*) fail "BUTTON_CHIP requires a numeric BUTTON_LINE" ;;
+    esac
+fi
+
+exit 0

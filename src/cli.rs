@@ -14,6 +14,7 @@ pub struct Args {
     pub dry_run: bool,
     pub once: bool,
     pub help: bool,
+    pub version: bool,
     pub test_fan_duty: Option<u8>,
     pub test_fan_seconds: u64,
 }
@@ -27,6 +28,7 @@ impl Default for Args {
             dry_run: false,
             once: false,
             help: false,
+            version: false,
             test_fan_duty: None,
             test_fan_seconds: 10,
         }
@@ -54,6 +56,8 @@ impl Args {
 
             if arg == "--help" || arg == "-h" {
                 parsed.help = true;
+            } else if arg == "--version" || arg == "-V" {
+                parsed.version = true;
             } else if arg == "--dry-run" {
                 parsed.dry_run = true;
             } else if arg == "--once" {
@@ -150,9 +154,14 @@ Options:
       --once                  Take one sample and exit
       --test-fan-duty <0-100> Set fan duty for a bounded manual test
       --test-fan-seconds <N>  Manual fan test duration [default: 10]
+  -V, --version               Print version
   -h, --help                  Show this help
 "
     )
+}
+
+pub fn version() -> &'static str {
+    concat!(env!("CARGO_PKG_NAME"), " ", env!("CARGO_PKG_VERSION"))
 }
 
 #[cfg(test)]
@@ -167,6 +176,7 @@ mod tests {
         assert_eq!(args.cpu_temp_path, PathBuf::from(DEFAULT_CPU_TEMP_PATH));
         assert!(!args.dry_run);
         assert!(!args.once);
+        assert!(!args.version);
         assert_eq!(args.test_fan_duty, None);
         assert_eq!(args.test_fan_seconds, 10);
     }
@@ -203,5 +213,13 @@ mod tests {
             .expect_err("invalid percent should fail");
 
         assert!(err.contains("--test-fan-duty"));
+    }
+
+    #[test]
+    fn parses_and_reports_version() {
+        let args = Args::parse_from(["daemon", "--version"]).expect("version flag should parse");
+
+        assert!(args.version);
+        assert_eq!(version(), "radxa-penta-top-hat-rs 1.0.0");
     }
 }

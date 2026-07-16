@@ -1,0 +1,62 @@
+#!/bin/sh
+set -eu
+
+output=${1:-/etc/rockpi-penta.env}
+model_file=${RADXA_PENTA_MODEL_FILE:-/proc/device-tree/model}
+gpio_root=${RADXA_PENTA_GPIO_ROOT:-/sys/bus/gpio/devices}
+device_root=${RADXA_PENTA_DEVICE_ROOT:-/dev}
+
+if [ -e "$output" ]; then
+    printf 'Preserving existing %s\n' "$output"
+    exit 0
+fi
+
+model=$(tr -d '\000' < "$model_file" 2>/dev/null || true)
+case "$model" in
+    *"Raspberry Pi 5"*) ;;
+    *)
+        printf 'No verified automatic board profile for: %s\n' "${model:-unknown board}" >&2
+        exit 2
+        ;;
+esac
+
+gpio_device=
+for candidate in "$gpio_root"/gpiochip*; do
+    [ -r "$candidate/uevent" ] || continue
+    if grep -Eq '^OF_COMPATIBLE_[0-9]+=raspberrypi,rp1-gpio$|^OF_FULLNAME=.*/rp1/gpio(@.*)?$' "$candidate/uevent"; then
+        devname=$(sed -n 's/^DEVNAME=//p' "$candidate/uevent" | sed -n '1p')
+        if [ -n "$devname" ] && [ -c "$device_root/$devname" ]; then
+            gpio_device="$device_root/$devname"
+            break
+        fi
+    fi
+done
+
+if [ -z "$gpio_device" ]; then
+    printf 'Could not locate the Raspberry Pi 5 RP1 GPIO character device.\n' >&2
+    exit 3
+fi
+
+output_dir=$(dirname -- "$output")
+install -d -m 0755 "$output_dir"
+temporary="${output}.tmp.$$"
+trap 'rm -f "$temporary"' 0 1 2 15
+umask 022
+
+{
+    printf '# Generated for %s by radxa-penta-top-hat-rs.\n' "$model"
+    printf 'SDA=SDA\n'
+    printf 'SCL=SCL\n'
+    printf 'OLED_I2C_DEVICE=/dev/i2c-1\n'
+    printf 'OLED_RESET=23\n'
+    printf 'BUTTON_CHIP=%s\n' "$gpio_device"
+    printf 'BUTTON_LINE=17\n'
+    printf 'FAN_CHIP=%s\n' "$gpio_device"
+    printf 'FAN_LINE=27\n'
+    printf 'HARDWARE_PWM=0\n'
+} > "$temporary"
+
+chmod 0644 "$temporary"
+mv -f "$temporary" "$output"
+trap - 0 1 2 15
+printf 'Created %s for %s using %s\n' "$output" "$model" "$gpio_device"

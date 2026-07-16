@@ -1,0 +1,41 @@
+[Unit]
+Description=Radxa Penta SATA HAT top-board controller
+Documentation=https://github.com/Vathivis/radxa-penta-top-hat-rs
+After=local-fs.target
+Conflicts=rockpi-penta.service
+ConditionPathExists=/etc/rockpi-penta.env
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+Group=root
+Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
+ExecCondition=/usr/lib/radxa-penta-top-hat-rs/validate-config /etc/rockpi-penta.env
+ExecStart=/usr/bin/radxa-penta-top-hat-rs --config /etc/rockpi-penta.conf --env-file /etc/rockpi-penta.env
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=10s
+KillSignal=SIGTERM
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=radxa-penta-top-hat-rs
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=full
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

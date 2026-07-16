@@ -1,0 +1,7 @@
+radxa-penta-top-hat-rs (1.0.0) stable; urgency=medium
+
+  * Initial Rust release with fan, OLED, and button control.
+  * Add continuous fan curves, optional SMART temperatures, and bounded logs.
+  * Package the static ARM64 daemon as a systemd-managed Debian service.
+
+ -- Vathivis <vojtahumpl@seznam.cz>  Thu, 16 Jul 2026 14:00:00 +0200

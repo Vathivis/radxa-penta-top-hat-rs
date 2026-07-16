@@ -1,0 +1,51 @@
+#!/bin/sh
+set -e
+
+unit=radxa-penta-top-hat-rs.service
+env_file=/etc/rockpi-penta.env
+
+case "$1" in
+    configure|abort-upgrade|abort-deconfigure|abort-remove)
+        if [ -z "${DPKG_ROOT:-}" ]; then
+            if [ ! -e "$env_file" ]; then
+                if /usr/lib/radxa-penta-top-hat-rs/configure-board "$env_file"; then
+                    :
+                else
+                    status=$?
+                    if [ "$status" -eq 2 ]; then
+                        printf '%s\n' \
+                            'Automatic configuration is currently verified only for Raspberry Pi 5.' \
+                            'Create /etc/rockpi-penta.env from the packaged example, then enable the service.'
+                    else
+                        printf '%s\n' \
+                            'Board detection did not produce /etc/rockpi-penta.env.' \
+                            'Check the kernel GPIO devices and configure the service manually.' >&2
+                    fi
+                fi
+            fi
+
+            if [ -e "$env_file" ] && command -v deb-systemd-helper >/dev/null 2>&1; then
+                deb-systemd-helper unmask "$unit" >/dev/null || true
+                if deb-systemd-helper --quiet was-enabled "$unit"; then
+                    deb-systemd-helper enable "$unit" >/dev/null || true
+                else
+                    deb-systemd-helper update-state "$unit" >/dev/null || true
+                fi
+            fi
+
+            if [ -d /run/systemd/system ]; then
+                systemctl --system daemon-reload >/dev/null || true
+                if [ -e "$env_file" ]; then
+                    if [ -n "${2:-}" ]; then
+                        action=try-restart
+                    else
+                        action=start
+                    fi
+                    deb-systemd-invoke "$action" "$unit" >/dev/null || true
+                fi
+            fi
+        fi
+        ;;
+esac
+
+exit 0

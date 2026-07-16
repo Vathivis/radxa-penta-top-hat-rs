@@ -115,16 +115,39 @@ Boolean options accept `true`/`false`, `yes`/`no`, `on`/`off`, or `1`/`0`.
 With `[fan_curve]` disabled, the daemon uses the original stepped fan behavior;
 with `[fan_drives]` disabled, only CPU temperature controls the fan.
 
-Build and run:
+Use `--dry-run --once` to print one fan decision without controlling the fan.
+
+## Installation
+
+Download the latest ARM64 Debian package from
+[GitHub Releases](https://github.com/Vathivis/radxa-penta-top-hat-rs/releases),
+then install and enable it:
 
 ```bash
-cargo build --release
-sudo ./target/release/radxa-penta-top-hat-rs \
-  --config /etc/rockpi-penta.conf \
-  --env-file /etc/rockpi-penta.env
+sudo apt install ./radxa-penta-top-hat-rs_*_arm64.deb
+sudo systemctl enable --now radxa-penta-top-hat-rs.service
+systemctl status radxa-penta-top-hat-rs.service
 ```
 
-Use `--dry-run --once` to print one fan decision without controlling the fan.
+Raspberry Pi 5 is configured automatically. On another ARM64 board, create and
+verify `/etc/rockpi-penta.env` for its GPIO and I2C layout before enabling the
+service. An editable example is installed at
+`/usr/share/doc/radxa-penta-top-hat-rs/examples/rockpi-penta.env`.
+
+## Build from source
+
+```bash
+git clone https://github.com/Vathivis/radxa-penta-top-hat-rs.git
+cd radxa-penta-top-hat-rs
+cargo build --locked --release
+```
+
+Build the installable ARM64 Debian package with:
+
+```bash
+rustup target add aarch64-unknown-linux-musl
+sh packaging/debian/build-deb.sh
+```
 
 ## Logging and retention
 

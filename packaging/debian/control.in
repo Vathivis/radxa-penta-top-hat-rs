@@ -1,0 +1,17 @@
+Package: radxa-penta-top-hat-rs
+Version: @VERSION@
+Section: utils
+Priority: optional
+Architecture: @ARCH@
+Maintainer: Vathivis <vojtahumpl@seznam.cz>
+Installed-Size: @INSTALLED_SIZE@
+Depends: init-system-helpers (>= 1.54~), systemd-sysv
+Recommends: smartmontools
+Provides: rockpi-penta
+Conflicts: rockpi-penta
+Replaces: rockpi-penta
+Homepage: https://github.com/Vathivis/radxa-penta-top-hat-rs
+Description: low-memory Radxa Penta SATA HAT top-board daemon
+ Controls the optional OLED display, fan, and button on the Radxa Penta
+ SATA HAT top board. This Rust implementation uses native Linux GPIO, I2C,
+ PWM, and thermal interfaces and runs as a systemd service.
