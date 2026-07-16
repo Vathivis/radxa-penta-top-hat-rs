@@ -1,0 +1,15 @@
+[Unit]
+Description=Rotate Radxa Penta top HAT daemon log
+Documentation=man:logrotate(8)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/logrotate --state /run/radxa-penta-logrotate.status /etc/logrotate-radxa-penta-top-hat-rs.conf
+PrivateTmp=no
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=full
+UMask=0077

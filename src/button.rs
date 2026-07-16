@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use crate::config::{KeyConfig, TimeConfig};
 use crate::env_file::PinMap;
 use crate::gpio_cdev::{GpioEdgeKind, GpioLine};
+use crate::oled::OledSignal;
 use crate::shutdown;
 
 const BUTTON_CONSUMER: &str = "hat_button";
@@ -27,7 +28,7 @@ impl ButtonRuntime {
         key_config: KeyConfig,
         time_config: TimeConfig,
         fan_enabled: Arc<AtomicBool>,
-        slide_requested: Arc<AtomicBool>,
+        oled_signal: Arc<OledSignal>,
     ) -> io::Result<Option<Self>> {
         let Some(button_chip) = pin_map.button_chip.as_deref() else {
             return Ok(None);
@@ -55,7 +56,7 @@ impl ButtonRuntime {
                     key_config,
                     time_config,
                     fan_enabled,
-                    slide_requested,
+                    oled_signal,
                     stop,
                     last_error,
                 );
@@ -89,7 +90,7 @@ fn run_button_loop(
     key_config: KeyConfig,
     time_config: TimeConfig,
     fan_enabled: Arc<AtomicBool>,
-    slide_requested: Arc<AtomicBool>,
+    oled_signal: Arc<OledSignal>,
     stop: Arc<AtomicBool>,
     last_error: Arc<Mutex<Option<String>>>,
 ) {
@@ -111,7 +112,7 @@ fn run_button_loop(
 
                 if let Some(gesture) = classifier.handle_edge(edge, Instant::now())
                     && let Err(err) =
-                        run_button_action(gesture, &key_config, &fan_enabled, &slide_requested)
+                        run_button_action(gesture, &key_config, &fan_enabled, &oled_signal)
                 {
                     store_error(&last_error, err);
                     break;
@@ -120,7 +121,7 @@ fn run_button_loop(
             Ok(None) => {
                 if let Some(gesture) = classifier.handle_timeout(Instant::now())
                     && let Err(err) =
-                        run_button_action(gesture, &key_config, &fan_enabled, &slide_requested)
+                        run_button_action(gesture, &key_config, &fan_enabled, &oled_signal)
                 {
                     store_error(&last_error, err);
                     break;
@@ -144,14 +145,14 @@ fn run_button_action(
     gesture: ButtonGesture,
     key_config: &KeyConfig,
     fan_enabled: &AtomicBool,
-    slide_requested: &AtomicBool,
+    oled_signal: &OledSignal,
 ) -> Result<(), String> {
     let action = action_for_gesture(gesture, key_config);
 
     match action {
         ButtonAction::None => {}
         ButtonAction::Slider => {
-            slide_requested.store(true, Ordering::SeqCst);
+            oled_signal.request();
             eprintln!("button: OLED next page requested");
         }
         ButtonAction::Switch => {
@@ -427,7 +428,7 @@ mod tests {
     #[test]
     fn slider_action_signals_oled_runtime() {
         let fan_enabled = AtomicBool::new(true);
-        let slide_requested = AtomicBool::new(false);
+        let oled_signal = OledSignal::default();
         let key_config = KeyConfig {
             click: "slider".to_string(),
             twice: "switch".to_string(),
@@ -438,10 +439,10 @@ mod tests {
             ButtonGesture::Click,
             &key_config,
             &fan_enabled,
-            &slide_requested,
+            &oled_signal,
         )
         .unwrap();
 
-        assert!(slide_requested.load(Ordering::SeqCst));
+        assert!(oled_signal.take_requested());
     }
 }

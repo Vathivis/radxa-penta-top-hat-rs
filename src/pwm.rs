@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::env_file::PinMap;
 use crate::gpio_cdev::GpioLine;
@@ -222,6 +222,7 @@ impl Drop for SoftwarePwm {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
+            thread.thread().unpark();
             let _ = thread.join();
         }
     }
@@ -265,37 +266,39 @@ fn drive_pwm_cycle<P>(
 where
     P: DigitalOutput,
 {
+    let cycle_start = Instant::now();
+    let cycle_deadline = cycle_start + period;
+
     if wire_duty == 0 {
         pin.set_active(false)?;
-        sleep_until_stop(period, stop);
+        wait_until_stop(cycle_deadline, stop);
         return Ok(());
     }
 
     if wire_duty >= DUTY_SCALE {
         pin.set_active(true)?;
-        sleep_until_stop(period, stop);
+        wait_until_stop(cycle_deadline, stop);
         return Ok(());
     }
 
     let active = duration_from_ppm(period, wire_duty);
-    let inactive = period.saturating_sub(active);
 
     pin.set_active(true)?;
-    sleep_until_stop(active, stop);
+    let active_deadline = Instant::now() + active;
+    wait_until_stop(active_deadline, stop);
     pin.set_active(false)?;
-    sleep_until_stop(inactive, stop);
+    wait_until_stop(cycle_deadline, stop);
 
     Ok(())
 }
 
-fn sleep_until_stop(duration: Duration, stop: &AtomicBool) {
-    let slice = Duration::from_millis(5);
-    let mut remaining = duration;
-
-    while !stop.load(Ordering::Relaxed) && !remaining.is_zero() {
-        let sleep_for = remaining.min(slice);
-        thread::sleep(sleep_for);
-        remaining = remaining.saturating_sub(sleep_for);
+fn wait_until_stop(deadline: Instant, stop: &AtomicBool) {
+    while !stop.load(Ordering::Relaxed) {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        thread::park_timeout(deadline.saturating_duration_since(now));
     }
 }
 
@@ -357,6 +360,30 @@ fn duration_from_ppm(period: Duration, duty_ppm: u32) -> Duration {
 mod tests {
     use super::*;
 
+    #[derive(Debug)]
+    struct NoopPin;
+
+    impl DigitalOutput for NoopPin {
+        fn set_active(&mut self, _active: bool) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct DelayedPin {
+        events: Vec<(bool, Instant)>,
+    }
+
+    impl DigitalOutput for DelayedPin {
+        fn set_active(&mut self, active: bool) -> io::Result<()> {
+            if active {
+                thread::sleep(Duration::from_millis(20));
+            }
+            self.events.push((active, Instant::now()));
+            Ok(())
+        }
+    }
+
     #[test]
     fn clamps_duty_fraction() {
         assert_eq!(Duty::from_fraction(-1.0).fraction(), 0.0);
@@ -400,5 +427,27 @@ mod tests {
     fn normalizes_pwmchip_names() {
         assert_eq!(normalize_pwmchip("14"), "pwmchip14");
         assert_eq!(normalize_pwmchip("pwmchip1"), "pwmchip1");
+    }
+
+    #[test]
+    fn dropping_software_pwm_interrupts_a_long_wait() {
+        let started = Instant::now();
+        let pwm = SoftwarePwm::start(NoopPin, Duration::from_secs(5), false);
+        thread::sleep(Duration::from_millis(10));
+
+        drop(pwm);
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn gpio_activation_latency_does_not_shorten_active_phase() {
+        let mut pin = DelayedPin::default();
+        let stop = AtomicBool::new(false);
+
+        drive_pwm_cycle(&mut pin, Duration::from_millis(50), 200_000, &stop).unwrap();
+
+        assert_eq!(pin.events.len(), 2);
+        assert!(pin.events[1].1.duration_since(pin.events[0].1) >= Duration::from_millis(8));
     }
 }

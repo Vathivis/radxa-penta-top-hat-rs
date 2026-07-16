@@ -125,3 +125,34 @@ sudo ./target/release/radxa-penta-top-hat-rs \
 ```
 
 Use `--dry-run --once` to print one fan decision without controlling the fan.
+
+## Logging and retention
+
+The direct-run daemon writes diagnostics to standard output and standard error.
+Routine fan messages are coalesced: safety boundaries are logged immediately,
+large output changes are limited to one per 10 seconds, and smaller drift or
+raw level chatter is summarized at most once per minute. Drive summaries log
+status transitions immediately and coalesce small duty changes for up to ten
+minutes. Rare failures and recoveries remain descriptive and immediate.
+
+The current host launch appends both streams to
+`/tmp/radxa-penta-top-hat-rs.log`. Because the stock Debian logrotate service
+uses a private `/tmp`, `packaging/` includes a dedicated size-check timer. It
+checks every 15 minutes, rotates at 1 MiB, and retains five compressed archives
+under `/var/log/radxa-penta-top-hat-rs`:
+
+```bash
+sudo install -d -m 0700 /var/log/radxa-penta-top-hat-rs
+sudo install -m 0600 packaging/logrotate.conf \
+  /etc/logrotate-radxa-penta-top-hat-rs.conf
+sudo install -m 0644 packaging/radxa-penta-logrotate.service \
+  /etc/systemd/system/radxa-penta-logrotate.service
+sudo install -m 0644 packaging/radxa-penta-logrotate.timer \
+  /etc/systemd/system/radxa-penta-logrotate.timer
+sudo systemctl daemon-reload
+sudo systemctl enable --now radxa-penta-logrotate.timer
+```
+
+`copytruncate` keeps the direct-running daemon attached to the active file.
+Once the daemon itself is systemd-managed, its output can move to the bounded
+system journal and this temporary file rotation can be removed.

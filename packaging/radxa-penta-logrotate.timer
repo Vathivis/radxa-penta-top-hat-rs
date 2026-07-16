@@ -1,0 +1,11 @@
+[Unit]
+Description=Check Radxa Penta top HAT daemon log size
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=15min
+AccuracySec=1min
+Unit=radxa-penta-logrotate.service
+
+[Install]
+WantedBy=timers.target

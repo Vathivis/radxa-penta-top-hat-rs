@@ -4,7 +4,7 @@ use std::os::fd::AsRawFd;
 use std::os::raw::{c_int, c_ulong};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -23,7 +23,6 @@ const DEFAULT_I2C_DEVICE: &str = "/dev/i2c-1";
 const SSD1306_ADDRESS: c_ulong = 0x3c;
 const I2C_SLAVE_IOCTL: c_ulong = 0x0703;
 const OLED_CONSUMER: &str = "hat_oled_reset";
-const THREAD_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 const MIN_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -31,9 +30,68 @@ unsafe extern "C" {
     fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
 }
 
+#[derive(Debug, Default)]
+pub struct OledSignal {
+    state: Mutex<OledSignalState>,
+    wake: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct OledSignalState {
+    requested: bool,
+    stopped: bool,
+}
+
+impl OledSignal {
+    pub fn request(&self) {
+        let mut state = self.lock_state();
+        state.requested = true;
+        self.wake.notify_one();
+    }
+
+    pub(crate) fn take_requested(&self) -> bool {
+        let mut state = self.lock_state();
+        std::mem::take(&mut state.requested)
+    }
+
+    fn wait(&self, timeout: Option<Duration>) {
+        let state = self.lock_state();
+        if state.requested || state.stopped {
+            return;
+        }
+
+        match timeout {
+            Some(timeout) => {
+                drop(self.wake.wait_timeout_while(state, timeout, |state| {
+                    !state.requested && !state.stopped
+                }));
+            }
+            None => {
+                drop(
+                    self.wake
+                        .wait_while(state, |state| !state.requested && !state.stopped),
+                );
+            }
+        }
+    }
+
+    fn stop(&self) {
+        let mut state = self.lock_state();
+        state.stopped = true;
+        self.wake.notify_one();
+    }
+
+    fn lock_state(&self) -> MutexGuard<'_, OledSignalState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 #[derive(Debug)]
 pub struct OledRuntime {
     stop: Arc<AtomicBool>,
+    signal: Arc<OledSignal>,
     last_error: Arc<Mutex<Option<String>>>,
     thread: Option<thread::JoinHandle<()>>,
 }
@@ -44,7 +102,7 @@ impl OledRuntime {
         config: OledConfig,
         cpu_temp_path: PathBuf,
         disks: Vec<String>,
-        slide_requested: Arc<AtomicBool>,
+        signal: Arc<OledSignal>,
         fan_percent: Arc<AtomicU8>,
     ) -> io::Result<Option<Self>> {
         if pin_map.sda.is_none() && pin_map.scl.is_none() {
@@ -75,6 +133,7 @@ impl OledRuntime {
         let last_error = Arc::new(Mutex::new(None));
         let thread = {
             let stop = Arc::clone(&stop);
+            let thread_signal = Arc::clone(&signal);
             let last_error = Arc::clone(&last_error);
             thread::spawn(move || {
                 if let Err(err) = run_oled_loop(
@@ -82,7 +141,7 @@ impl OledRuntime {
                     config,
                     &cpu_temp_path,
                     &disks,
-                    slide_requested,
+                    thread_signal,
                     fan_percent,
                     &stop,
                 ) {
@@ -96,6 +155,7 @@ impl OledRuntime {
 
         Ok(Some(Self {
             stop,
+            signal,
             last_error,
             thread: Some(thread),
         }))
@@ -112,6 +172,7 @@ impl OledRuntime {
 impl Drop for OledRuntime {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
+        self.signal.stop();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -123,7 +184,7 @@ fn run_oled_loop(
     config: OledConfig,
     cpu_temp_path: &Path,
     disks: &[String],
-    slide_requested: Arc<AtomicBool>,
+    signal: Arc<OledSignal>,
     fan_percent: Arc<AtomicU8>,
     stop: &AtomicBool,
 ) -> io::Result<()> {
@@ -133,7 +194,7 @@ fn run_oled_loop(
 
     while !stop.load(Ordering::SeqCst) && !shutdown::requested() {
         let now = Instant::now();
-        let manual_slide = slide_requested.swap(false, Ordering::SeqCst);
+        let manual_slide = signal.take_requested();
 
         match schedule.update(
             now,
@@ -161,7 +222,7 @@ fn run_oled_loop(
             }
         }
 
-        thread::sleep(THREAD_POLL_INTERVAL);
+        signal.wait(schedule.next_wait(Instant::now(), sleep_after));
     }
 
     Ok(())
@@ -234,6 +295,19 @@ impl OledSchedule {
         }
 
         OledUpdate::None
+    }
+
+    fn next_wait(&self, now: Instant, sleep_after: Option<Duration>) -> Option<Duration> {
+        if self.blank {
+            return None;
+        }
+
+        let mut deadline = self.next_refresh;
+        if let Some(sleep_after) = sleep_after {
+            deadline = deadline.min(self.last_manual_event + sleep_after);
+        }
+
+        Some(deadline.saturating_duration_since(now))
     }
 }
 
@@ -563,6 +637,54 @@ mod tests {
                 page: 1,
                 wake: true,
             }
+        );
+    }
+
+    #[test]
+    fn oled_signal_coalesces_pending_page_requests() {
+        let signal = OledSignal::default();
+
+        signal.request();
+        signal.request();
+
+        assert!(signal.take_requested());
+        assert!(!signal.take_requested());
+    }
+
+    #[test]
+    fn oled_signal_stop_unblocks_an_indefinite_wait() {
+        let signal = Arc::new(OledSignal::default());
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let waiter = {
+            let signal = Arc::clone(&signal);
+            thread::spawn(move || {
+                signal.wait(None);
+                finished_tx.send(()).unwrap();
+            })
+        };
+        thread::sleep(Duration::from_millis(10));
+
+        signal.stop();
+
+        assert!(finished_rx.recv_timeout(Duration::from_secs(1)).is_ok());
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn schedule_waits_for_the_earliest_deadline_and_parks_when_blank() {
+        let start = Instant::now();
+        let refresh = Duration::from_secs(10);
+        let sleep = Some(Duration::from_secs(5));
+        let mut schedule = OledSchedule::new(start, refresh);
+
+        assert_eq!(schedule.next_wait(start, sleep), sleep);
+        assert_eq!(
+            schedule.update(start + Duration::from_secs(5), false, false, refresh, sleep),
+            OledUpdate::Blank
+        );
+        assert_eq!(
+            schedule.next_wait(start + Duration::from_secs(5), sleep),
+            None
         );
     }
 
