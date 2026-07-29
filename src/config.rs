@@ -74,10 +74,10 @@ pub struct OledConfig {
 impl Default for FanConfig {
     fn default() -> Self {
         Self {
-            lv0: 35.0,
-            lv1: 40.0,
-            lv2: 45.0,
-            lv3: 50.0,
+            lv0: 50.0,
+            lv1: 60.0,
+            lv2: 67.5,
+            lv3: 75.0,
         }
     }
 }
@@ -515,10 +515,10 @@ mod tests {
         assert_eq!(
             config.fan,
             FanConfig {
-                lv0: 35.0,
-                lv1: 40.0,
-                lv2: 45.0,
-                lv3: 50.0,
+                lv0: 50.0,
+                lv1: 60.0,
+                lv2: 67.5,
+                lv3: 75.0,
             }
         );
         assert_eq!(
@@ -596,6 +596,17 @@ mod tests {
         assert!(!config.oled.auto_slide);
         assert_eq!(config.oled.sleep, 60.0);
         assert_eq!(config.disks, vec!["sdc1".to_string(), "sdd1".to_string()]);
+    }
+
+    #[test]
+    fn parses_fractional_cpu_threshold() {
+        let config = Config::parse("[fan]\nlv0 = 50\nlv1 = 60\nlv2 = 67.5\nlv3 = 75\n")
+            .expect("fractional CPU threshold should parse");
+
+        assert_eq!(config.fan.lv0, 50.0);
+        assert_eq!(config.fan.lv1, 60.0);
+        assert_eq!(config.fan.lv2, 67.5);
+        assert_eq!(config.fan.lv3, 75.0);
     }
 
     #[test]

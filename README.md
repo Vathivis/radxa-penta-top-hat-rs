@@ -32,10 +32,10 @@ Current working example:
 
 ```ini
 [fan]
-lv0 = 45
-lv1 = 53
-lv2 = 59
-lv3 = 63
+lv0 = 50
+lv1 = 60
+lv2 = 67.5
+lv3 = 75
 
 [key]
 click = slider
@@ -80,8 +80,8 @@ ramp_down = 5
 ### Option reference
 
 - `[fan]`: `lv0` through `lv3` are the four strictly increasing CPU-temperature
-  inflection points in degrees Celsius. Below `lv0` the requested fan duty is
-  zero.
+  inflection points in degrees Celsius; decimal values such as `67.5` are
+  supported. Below `lv0` the requested fan duty is zero.
 - `[fan_curve]`: `enabled` selects the interpolated curve. `duty0` through
   `duty3` are the nondecreasing fan percentages at the four temperature points.
   `tail=hold` keeps `duty3` above the last point; `tail=extrapolate` continues
