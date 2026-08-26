@@ -154,6 +154,18 @@ rustup target add aarch64-unknown-linux-musl
 sh packaging/debian/build-deb.sh
 ```
 
+Build the complete GitHub release artifact set (standalone binary, tarball,
+Debian package, and checksums) with:
+
+```bash
+sh packaging/build-release.sh
+```
+
+GitHub Actions runs formatting, tests, Clippy, and the ARM64 package build for
+pull requests and pushes to `main`. When the version in `Cargo.toml` increases
+on `main` and matches `Cargo.lock` plus the Debian changelog, it publishes the
+four artifacts as a `v<version>` GitHub release.
+
 ## Logging and retention
 
 The direct-run daemon writes diagnostics to standard output and standard error.
