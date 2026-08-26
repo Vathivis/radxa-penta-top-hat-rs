@@ -1,0 +1,216 @@
+name: CI and release
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    name: Test and validate
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      should_release: ${{ steps.version.outputs.should_release }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+
+      - name: Validate version metadata and release decision
+        id: version
+        shell: bash
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+
+          version=$(sh packaging/check-version.sh)
+          should_release=false
+
+          if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF" == "refs/heads/main" ]]; then
+            if [[ -z "$BEFORE_SHA" || "$BEFORE_SHA" =~ ^0+$ ]]; then
+              echo "::error::Cannot determine the previous main-branch revision"
+              exit 1
+            fi
+
+            previous_version=$(
+              git show "${BEFORE_SHA}:Cargo.toml" |
+                sed -n 's/^version = "\([^"]*\)"/\1/p' |
+                sed -n '1p'
+            )
+            if [[ -z "$previous_version" ]]; then
+              echo "::error::Cannot read the package version at $BEFORE_SHA"
+              exit 1
+            fi
+
+            if [[ "$version" != "$previous_version" ]]; then
+              if ! dpkg --compare-versions "$version" gt "$previous_version"; then
+                echo "::error::Version changed from $previous_version to $version, but it was not increased"
+                exit 1
+              fi
+              should_release=true
+            fi
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "should_release=$should_release" >> "$GITHUB_OUTPUT"
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run tests
+        run: cargo test --locked --all-targets
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+  package:
+    name: Build ARM64 release artifacts
+    needs: validate
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+
+      - name: Install Rust target
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add aarch64-unknown-linux-musl
+
+      - name: Build release artifacts
+        run: sh packaging/build-release.sh
+
+      - name: Verify release checksums
+        working-directory: dist
+        run: sha256sum --check SHA256SUMS
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-v${{ needs.validate.outputs.version }}
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            dist/radxa-penta-top-hat-rs-v${{ needs.validate.outputs.version }}-aarch64-unknown-linux-musl
+            dist/radxa-penta-top-hat-rs-v${{ needs.validate.outputs.version }}-aarch64-unknown-linux-musl.tar.gz
+            dist/radxa-penta-top-hat-rs_${{ needs.validate.outputs.version }}_arm64.deb
+            dist/SHA256SUMS
+
+  release:
+    name: Publish GitHub release
+    if: needs.validate.outputs.should_release == 'true'
+    needs:
+      - validate
+      - package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Check out source and tags
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: release-v${{ needs.validate.outputs.version }}
+          path: dist
+
+      - name: Verify downloaded artifacts
+        working-directory: dist
+        run: sha256sum --check SHA256SUMS
+
+      - name: Prepare change-only release notes
+        run: |
+          awk '
+            NR == 1 { next }
+            /^ -- / { exit }
+            /^[[:space:]]+\*/ {
+              sub(/^[[:space:]]+\*[[:space:]]*/, "- ")
+              print
+            }
+          ' packaging/debian/changelog > release-notes.md
+          test -s release-notes.md
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          tag="v${VERSION}"
+          assets=(
+            "dist/radxa-penta-top-hat-rs-v${VERSION}-aarch64-unknown-linux-musl"
+            "dist/radxa-penta-top-hat-rs-v${VERSION}-aarch64-unknown-linux-musl.tar.gz"
+            "dist/radxa-penta-top-hat-rs_${VERSION}_arm64.deb"
+            "dist/SHA256SUMS"
+          )
+
+          if git rev-parse --verify --quiet "refs/tags/${tag}^{commit}" >/dev/null; then
+            tagged_sha=$(git rev-parse "refs/tags/${tag}^{commit}")
+            if [[ "$tagged_sha" != "$GITHUB_SHA" ]]; then
+              echo "::error::${tag} already points to ${tagged_sha}, not ${GITHUB_SHA}"
+              exit 1
+            fi
+          fi
+
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            mapfile -t existing_assets < <(
+              gh release view "$tag" \
+                --repo "$GITHUB_REPOSITORY" \
+                --json assets \
+                --jq '.assets[].name'
+            )
+            for asset in "${assets[@]}"; do
+              asset_name=${asset##*/}
+              present=false
+              for existing_asset in "${existing_assets[@]}"; do
+                if [[ "$existing_asset" == "$asset_name" ]]; then
+                  present=true
+                  break
+                fi
+              done
+              if [[ "$present" == "false" ]]; then
+                gh release upload "$tag" "$asset" --repo "$GITHUB_REPOSITORY"
+              fi
+            done
+            gh release edit "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$tag" \
+              --notes-file release-notes.md \
+              --draft=false
+          else
+            gh release create "$tag" "${assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "$tag" \
+              --notes-file release-notes.md
+          fi

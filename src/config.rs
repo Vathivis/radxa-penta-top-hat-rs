@@ -156,9 +156,11 @@ impl Config {
 
     pub fn parse(input: &str) -> Result<Self, ConfigError> {
         let ini = parse_ini(input)?;
+        validate_sections(&ini)?;
         let mut config = Self::default();
 
         if let Some(section) = ini.get("fan") {
+            validate_section_keys("fan", section, &["lv0", "lv1", "lv2", "lv3"])?;
             config.fan.lv0 = parse_f64(section, "lv0", config.fan.lv0)?;
             config.fan.lv1 = parse_f64(section, "lv1", config.fan.lv1)?;
             config.fan.lv2 = parse_f64(section, "lv2", config.fan.lv2)?;
@@ -196,6 +198,19 @@ impl Config {
         }
 
         if let Some(section) = ini.get("fan_drives") {
+            validate_section_keys(
+                "fan_drives",
+                section,
+                &[
+                    "enabled",
+                    "devices",
+                    "lv0",
+                    "lv1",
+                    "lv2",
+                    "lv3",
+                    "poll_seconds",
+                ],
+            )?;
             config.fan_drives.enabled = parse_bool(section, "enabled", config.fan_drives.enabled)?;
             if let Some(devices) = section.get("devices") {
                 config.fan_drives.devices = split_csv(devices);
@@ -213,17 +228,24 @@ impl Config {
         }
 
         if let Some(section) = ini.get("key") {
+            validate_section_keys("key", section, &["click", "twice", "press"])?;
             config.key.click = get_string(section, "click", &config.key.click);
             config.key.twice = get_string(section, "twice", &config.key.twice);
             config.key.press = get_string(section, "press", &config.key.press);
         }
 
         if let Some(section) = ini.get("time") {
+            validate_section_keys("time", section, &["twice", "press"])?;
             config.time.twice = parse_f64(section, "twice", config.time.twice)?;
             config.time.press = parse_f64(section, "press", config.time.press)?;
         }
 
         if let Some(section) = ini.get("oled") {
+            validate_section_keys(
+                "oled",
+                section,
+                &["rotate", "f-temp", "auto_slide", "auto_slide_time", "sleep"],
+            )?;
             config.oled.rotate = parse_bool(section, "rotate", config.oled.rotate)?;
             config.oled.f_temp = parse_bool(section, "f-temp", config.oled.f_temp)?;
             config.oled.auto_slide = parse_bool(section, "auto_slide", config.oled.auto_slide)?;
@@ -232,15 +254,19 @@ impl Config {
             config.oled.sleep = parse_f64(section, "sleep", config.oled.sleep)?;
         }
 
-        if let Some(section) = ini.get("disk")
-            && let Some(extra) = section.get("extra")
-        {
-            config.disks = split_csv(extra);
+        if let Some(section) = ini.get("disk") {
+            validate_section_keys("disk", section, &["extra"])?;
+            if let Some(extra) = section.get("extra") {
+                config.disks = split_csv(extra);
+            }
         }
 
         validate_fan_thresholds("fan", config.fan)?;
         validate_fan_thresholds("fan_drives", config.fan_drives.thresholds)?;
         validate_fan_curve(config.fan_curve)?;
+        validate_key_action("click", &config.key.click)?;
+        validate_key_action("twice", &config.key.twice)?;
+        validate_key_action("press", &config.key.press)?;
 
         Ok(config)
     }
@@ -419,6 +445,44 @@ fn validate_fan_curve(config: FanCurveConfig) -> Result<(), ConfigError> {
     }
 }
 
+fn validate_sections(ini: &Ini) -> Result<(), ConfigError> {
+    const ALLOWED: &[&str] = &[
+        "fan",
+        "fan_curve",
+        "fan_drives",
+        "key",
+        "time",
+        "oled",
+        "disk",
+    ];
+
+    if let Some(section) = ini
+        .keys()
+        .find(|section| !ALLOWED.contains(&section.as_str()))
+    {
+        Err(ConfigError::UnknownSection {
+            section: section.clone(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_key_action(key: &'static str, action: &str) -> Result<(), ConfigError> {
+    if matches!(
+        action.trim().to_ascii_lowercase().as_str(),
+        "slider" | "switch" | "reboot" | "poweroff" | "none"
+    ) {
+        Ok(())
+    } else {
+        Err(ConfigError::Value {
+            key: key.to_string(),
+            value: action.to_string(),
+            expected: "slider, switch, reboot, poweroff, or none",
+        })
+    }
+}
+
 fn validate_section_keys(
     section_name: &'static str,
     section: &Section,
@@ -467,6 +531,9 @@ pub enum ConfigError {
         section: &'static str,
     },
     FanCurveDuties,
+    UnknownSection {
+        section: String,
+    },
     UnknownKey {
         section: &'static str,
         key: String,
@@ -496,6 +563,9 @@ impl std::fmt::Display for ConfigError {
                 f,
                 "invalid [fan_curve] duties: duty0 through duty3 must be nondecreasing"
             ),
+            Self::UnknownSection { section } => {
+                write!(f, "unknown config section [{section}]")
+            }
             Self::UnknownKey { section, key } => {
                 write!(f, "unknown key {key:?} in [{section}]")
             }
@@ -775,6 +845,54 @@ mod tests {
 
         assert!(err.to_string().contains("max-duty"));
         assert!(err.to_string().contains("[fan_curve]"));
+    }
+
+    #[test]
+    fn rejects_unknown_config_section() {
+        let err = Config::parse(
+            r#"
+            [fan_drive]
+            enabled = true
+            "#,
+        )
+        .expect_err("misspelled section should fail");
+
+        assert!(err.to_string().contains("[fan_drive]"));
+        assert!(err.to_string().contains("unknown config section"));
+    }
+
+    #[test]
+    fn rejects_unknown_keys_in_all_other_sections() {
+        for (section, entry, key) in [
+            ("fan", "level0 = 50", "level0"),
+            ("fan_drives", "device = /dev/sdc", "device"),
+            ("key", "double = switch", "double"),
+            ("time", "double = 0.7", "double"),
+            ("oled", "auto-slide = true", "auto-slide"),
+            ("disk", "extras = sda1", "extras"),
+        ] {
+            let input = format!("[{section}]\n{entry}\n");
+            let err = Config::parse(&input).expect_err("unknown key should fail");
+            let message = err.to_string();
+
+            assert!(message.contains(&format!("[{section}]")), "{message}");
+            assert!(message.contains(key), "{message}");
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_button_action() {
+        let err = Config::parse(
+            r#"
+            [key]
+            twice = toggle
+            "#,
+        )
+        .expect_err("unknown button action should fail");
+
+        assert!(err.to_string().contains("twice"));
+        assert!(err.to_string().contains("toggle"));
+        assert!(err.to_string().contains("slider"));
     }
 
     #[test]
