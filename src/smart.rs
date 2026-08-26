@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
 use std::process::{Command, Stdio};
@@ -52,6 +53,83 @@ impl DriveTemperaturePoll {
         self.readings
             .iter()
             .max_by_key(|reading| reading.temperature.current_celsius)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CachedDriveTemperature {
+    temperature: DriveTemperature,
+    observed_at: Instant,
+}
+
+#[derive(Debug, Default)]
+pub struct DriveTemperatureState {
+    cached: BTreeMap<String, CachedDriveTemperature>,
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct EffectiveDriveTemperatures {
+    pub readings: Vec<DriveTemperatureReading>,
+    pub stale_devices: Vec<String>,
+    pub fail_safe_devices: Vec<String>,
+}
+
+impl EffectiveDriveTemperatures {
+    pub fn hottest(&self) -> Option<&DriveTemperatureReading> {
+        self.readings
+            .iter()
+            .max_by_key(|reading| reading.temperature.current_celsius)
+    }
+
+    pub fn requires_fail_safe(&self) -> bool {
+        !self.fail_safe_devices.is_empty()
+    }
+}
+
+impl DriveTemperatureState {
+    pub fn update(
+        &mut self,
+        poll: &DriveTemperaturePoll,
+        now: Instant,
+        grace_period: Duration,
+    ) -> EffectiveDriveTemperatures {
+        let mut effective = EffectiveDriveTemperatures::default();
+
+        for reading in &poll.readings {
+            self.cached.insert(
+                reading.device.clone(),
+                CachedDriveTemperature {
+                    temperature: reading.temperature,
+                    observed_at: now,
+                },
+            );
+            effective.readings.push(reading.clone());
+        }
+
+        for device in &poll.standby_devices {
+            self.cached.remove(device);
+        }
+
+        for failure in &poll.failures {
+            let cached = self.cached.get(&failure.device).copied();
+            match cached {
+                Some(cached)
+                    if now.saturating_duration_since(cached.observed_at) <= grace_period =>
+                {
+                    effective.readings.push(DriveTemperatureReading {
+                        device: failure.device.clone(),
+                        temperature: cached.temperature,
+                    });
+                    effective.stale_devices.push(failure.device.clone());
+                }
+                _ => {
+                    self.cached.remove(&failure.device);
+                    effective.fail_safe_devices.push(failure.device.clone());
+                }
+            }
+        }
+
+        effective
     }
 }
 
@@ -514,6 +592,16 @@ fn matching_brace(input: &str, open_idx: usize) -> Option<usize> {
 mod tests {
     use super::*;
 
+    fn temperature_reading(device: &str, current_celsius: i32) -> DriveTemperatureReading {
+        DriveTemperatureReading {
+            device: device.to_string(),
+            temperature: DriveTemperature {
+                current_celsius,
+                source: SmartTemperatureSource::JsonTemperatureCurrent,
+            },
+        }
+    }
+
     #[test]
     fn parses_smartctl_json_temperature_current() {
         let output = r#"{
@@ -836,5 +924,125 @@ ID# ATTRIBUTE_NAME          FLAG     VALUE WORST THRESH TYPE      UPDATED  WHEN_
         assert!(poll.failures.is_empty());
         assert_eq!(poll.standby_devices, devices);
         assert!(poll.hottest().is_none());
+    }
+
+    #[test]
+    fn transient_failure_keeps_recent_temperature_until_grace_expires() {
+        let started = Instant::now();
+        let grace = Duration::from_secs(60);
+        let mut state = DriveTemperatureState::default();
+        let fresh = DriveTemperaturePoll {
+            readings: vec![temperature_reading("/dev/sdc", 47)],
+            ..DriveTemperaturePoll::default()
+        };
+        let failure = DriveTemperaturePoll {
+            failures: vec![DriveTemperatureFailure {
+                device: "/dev/sdc".to_string(),
+                error: "temporary SMART error".to_string(),
+            }],
+            ..DriveTemperaturePoll::default()
+        };
+
+        state.update(&fresh, started, grace);
+        let stale = state.update(&failure, started + Duration::from_secs(30), grace);
+
+        assert_eq!(
+            stale
+                .hottest()
+                .map(|reading| reading.temperature.current_celsius),
+            Some(47)
+        );
+        assert_eq!(stale.stale_devices, vec!["/dev/sdc"]);
+        assert!(!stale.requires_fail_safe());
+
+        let expired = state.update(&failure, started + Duration::from_secs(61), grace);
+        assert!(expired.readings.is_empty());
+        assert_eq!(expired.fail_safe_devices, vec!["/dev/sdc"]);
+        assert!(expired.requires_fail_safe());
+    }
+
+    #[test]
+    fn standby_clears_cached_temperature_without_requesting_fail_safe() {
+        let started = Instant::now();
+        let grace = Duration::from_secs(60);
+        let mut state = DriveTemperatureState::default();
+        let fresh = DriveTemperaturePoll {
+            readings: vec![temperature_reading("/dev/sdc", 47)],
+            ..DriveTemperaturePoll::default()
+        };
+        let standby = DriveTemperaturePoll {
+            standby_devices: vec!["/dev/sdc".to_string()],
+            ..DriveTemperaturePoll::default()
+        };
+
+        state.update(&fresh, started, grace);
+        let effective = state.update(&standby, started + Duration::from_secs(30), grace);
+
+        assert!(effective.readings.is_empty());
+        assert!(!effective.requires_fail_safe());
+
+        let failure = DriveTemperaturePoll {
+            failures: vec![DriveTemperatureFailure {
+                device: "/dev/sdc".to_string(),
+                error: "unavailable".to_string(),
+            }],
+            ..DriveTemperaturePoll::default()
+        };
+        let unavailable = state.update(&failure, started + Duration::from_secs(31), grace);
+        assert!(unavailable.requires_fail_safe());
+    }
+
+    #[test]
+    fn uncached_partial_failure_requires_fail_safe_despite_other_readings() {
+        let mut state = DriveTemperatureState::default();
+        let poll = DriveTemperaturePoll {
+            readings: vec![temperature_reading("/dev/sdc", 40)],
+            failures: vec![DriveTemperatureFailure {
+                device: "/dev/sdd".to_string(),
+                error: "unavailable".to_string(),
+            }],
+            ..DriveTemperaturePoll::default()
+        };
+
+        let effective = state.update(&poll, Instant::now(), Duration::from_secs(60));
+
+        assert_eq!(
+            effective
+                .hottest()
+                .map(|reading| reading.temperature.current_celsius),
+            Some(40)
+        );
+        assert_eq!(effective.fail_safe_devices, vec!["/dev/sdd"]);
+        assert!(effective.requires_fail_safe());
+    }
+
+    #[test]
+    fn successful_read_recovers_from_fail_safe() {
+        let started = Instant::now();
+        let grace = Duration::from_secs(60);
+        let mut state = DriveTemperatureState::default();
+        let failure = DriveTemperaturePoll {
+            failures: vec![DriveTemperatureFailure {
+                device: "/dev/sdc".to_string(),
+                error: "unavailable".to_string(),
+            }],
+            ..DriveTemperaturePoll::default()
+        };
+        assert!(state.update(&failure, started, grace).requires_fail_safe());
+
+        let recovered = DriveTemperaturePoll {
+            readings: vec![temperature_reading("/dev/sdc", 42)],
+            ..DriveTemperaturePoll::default()
+        };
+        let effective = state.update(&recovered, started + Duration::from_secs(30), grace);
+
+        assert!(!effective.requires_fail_safe());
+        assert!(effective.stale_devices.is_empty());
+        assert_eq!(
+            effective
+                .hottest()
+                .map(|reading| reading.temperature.current_celsius),
+            Some(42)
+        );
     }
 }

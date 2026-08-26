@@ -93,7 +93,10 @@ ramp_down = 5
   a comma-separated list of device paths queried with standby-safe `smartctl`;
   `lv0` through `lv3` are their temperature points and `poll_seconds` is the
   positive polling interval. CPU and disk control share `[fan_curve]`, and the
-  higher requested duty wins.
+  higher requested duty wins. A failed read retains that device's most recent
+  temperature for two polling intervals. If no recent reading is available,
+  the fan uses `max_duty` until the device reports a temperature or explicit
+  standby state.
 - `[key]`: `click`, `twice`, and `press` assign actions to a single click,
   double click, and long press. Actions are `slider` (wake or next OLED page),
   `switch` (toggle fan control), `reboot`, `poweroff`, or `none`.
@@ -112,6 +115,8 @@ ramp_down = 5
   `[fan_drives].devices`.
 
 Boolean options accept `true`/`false`, `yes`/`no`, `on`/`off`, or `1`/`0`.
+Unknown configuration sections and keys are rejected at startup, as are
+unsupported button action names.
 With `[fan_curve]` disabled, the daemon uses the original stepped fan behavior;
 with `[fan_drives]` disabled, only CPU temperature controls the fan.
 

@@ -16,7 +16,9 @@ use radxa_penta_top_hat_rs::fan::{
 use radxa_penta_top_hat_rs::oled::{OledRuntime, OledSignal};
 use radxa_penta_top_hat_rs::pwm::{Duty, FanOutput, FanPwmOutput};
 use radxa_penta_top_hat_rs::shutdown;
-use radxa_penta_top_hat_rs::smart::{DriveTemperatureFailure, poll_drive_temperatures};
+use radxa_penta_top_hat_rs::smart::{
+    DriveTemperatureFailure, DriveTemperatureState, poll_drive_temperatures,
+};
 use radxa_penta_top_hat_rs::temp::read_cpu_temp_c;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -24,6 +26,8 @@ struct DriveLogSnapshot {
     level: Option<FanLevel>,
     duty_percent: Option<u8>,
     standby_devices: Vec<String>,
+    stale_devices: Vec<String>,
+    fail_safe_devices: Vec<String>,
     failures: Vec<DriveFailureLogKey>,
 }
 
@@ -52,6 +56,8 @@ impl DriveLogState {
             Some(last) => {
                 let availability_changed = last.level.is_some() != snapshot.level.is_some();
                 let status_changed = last.standby_devices != snapshot.standby_devices
+                    || last.stale_devices != snapshot.stale_devices
+                    || last.fail_safe_devices != snapshot.fail_safe_devices
                     || last.failures != snapshot.failures;
                 let level_changed = last.level != snapshot.level;
                 let duty_change = match (last.duty_percent, snapshot.duty_percent) {
@@ -176,6 +182,12 @@ impl fmt::Display for FanLogLine<'_> {
             self.decision.drive_level,
             self.decision.drive_duty_percent,
         ) {
+            (Some(temp_c), Some(level), Some(duty_percent)) if !temp_c.is_finite() => write!(
+                output,
+                " drv=err/{}/{}%",
+                fan_level_label(level),
+                duty_percent
+            )?,
             (Some(temp_c), Some(level), Some(duty_percent)) => write!(
                 output,
                 " drv={temp_c:.1}C/{}/{}%",
@@ -373,8 +385,10 @@ fn run() -> Result<(), String> {
     };
     let drive_polling_enabled = config.fan_drives.enabled && !config.fan_drives.devices.is_empty();
     let drive_poll_interval = Duration::from_secs(config.fan_drives.poll_seconds);
+    let drive_failure_grace = drive_poll_interval.saturating_mul(2);
     let mut last_drive_poll = None;
     let mut hottest_drive_temp_c = None;
+    let mut drive_temperature_state = DriveTemperatureState::default();
     let mut drive_log_state = DriveLogState::default();
 
     if config.fan_curve.enabled {
@@ -444,12 +458,18 @@ fn run() -> Result<(), String> {
                 .unwrap_or(true)
         {
             let poll = poll_drive_temperatures(&config.fan_drives.devices);
-            last_drive_poll = Some(Instant::now());
+            let polled_at = Instant::now();
+            last_drive_poll = Some(polled_at);
             polled_drives = true;
 
-            hottest_drive_temp_c = poll
-                .hottest()
-                .map(|reading| f64::from(reading.temperature.current_celsius));
+            let effective = drive_temperature_state.update(&poll, polled_at, drive_failure_grace);
+            hottest_drive_temp_c = if effective.requires_fail_safe() {
+                Some(f64::NAN)
+            } else {
+                effective
+                    .hottest()
+                    .map(|reading| f64::from(reading.temperature.current_celsius))
+            };
             let drive_level = hottest_drive_temp_c
                 .map(|temp_c| level_for_temperature(temp_c, config.fan_drives.thresholds));
             let drive_duty = hottest_drive_temp_c.map(|temp_c| {
@@ -459,6 +479,8 @@ fn run() -> Result<(), String> {
                 level: drive_level,
                 duty_percent: drive_duty,
                 standby_devices: poll.standby_devices.clone(),
+                stale_devices: effective.stale_devices.clone(),
+                fail_safe_devices: effective.fail_safe_devices.clone(),
                 failures: poll.failures.iter().map(drive_failure_log_key).collect(),
             };
 
@@ -470,8 +492,23 @@ fn run() -> Result<(), String> {
                     );
                 }
 
-                if let Some(hottest) = poll.hottest() {
-                    let readings = poll
+                if effective.requires_fail_safe() {
+                    let devices = effective
+                        .fail_safe_devices
+                        .iter()
+                        .map(|device| short_device_name(device))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    eprintln!(
+                        "fan-drives: unavailable={} stale={} standby={} errors={}; commanding fail-safe maximum duty {}%",
+                        devices,
+                        effective.stale_devices.len(),
+                        poll.standby_devices.len(),
+                        poll.failures.len(),
+                        maximum_duty
+                    );
+                } else if let Some(hottest) = effective.hottest() {
+                    let readings = effective
                         .readings
                         .iter()
                         .map(|reading| {
@@ -484,12 +521,13 @@ fn run() -> Result<(), String> {
                         .collect::<Vec<_>>()
                         .join(",");
                     eprintln!(
-                        "fan-drives: tempC={} hot={}/{}C/{}/{}% standby={} errors={}",
+                        "fan-drives: tempC={} hot={}/{}C/{}/{}% stale={} standby={} errors={}",
                         readings,
                         short_device_name(&hottest.device),
                         hottest.temperature.current_celsius,
                         fan_level_label(drive_level.unwrap_or(FanLevel::Off)),
                         drive_duty.unwrap_or(0),
+                        effective.stale_devices.len(),
                         poll.standby_devices.len(),
                         poll.failures.len()
                     );
@@ -874,12 +912,36 @@ mod tests {
     }
 
     #[test]
+    fn compact_fan_log_formats_drive_fail_safe() {
+        let thresholds = radxa_penta_top_hat_rs::config::FanConfig {
+            lv0: 40.0,
+            lv1: 50.0,
+            lv2: 60.0,
+            lv3: 70.0,
+        };
+        let decision = FanDecision::from_temperatures(45.0, thresholds, Some(f64::NAN), thresholds);
+        let line = FanLogLine {
+            decision: &decision,
+            commanded_duty_percent: 100,
+            enabled: true,
+        }
+        .to_string();
+
+        assert_eq!(
+            line,
+            "fan: cpu=45.0C/L0/25% drv=err/L3/100% target=L3/100% out=100% on"
+        );
+    }
+
+    #[test]
     fn drive_logging_limits_small_duty_drift() {
         fn snapshot(duty_percent: u8) -> DriveLogSnapshot {
             DriveLogSnapshot {
                 level: Some(FanLevel::Lv0),
                 duty_percent: Some(duty_percent),
                 standby_devices: Vec::new(),
+                stale_devices: Vec::new(),
+                fail_safe_devices: Vec::new(),
                 failures: Vec::new(),
             }
         }
