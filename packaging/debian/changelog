@@ -2,7 +2,7 @@ radxa-penta-top-hat-rs (1.0.3) stable; urgency=medium
 
   * Keep fan control available when the optional OLED device is missing.
   * Recognize a long press following a click and preserve edges at click expiry.
-  * Reject invalid and overflowing timer values before hardware initialization.
+  * Limit timers to finite values from zero through 365 days before hardware initialization.
 
  -- Vathivis <vojtahumpl@seznam.cz>  Sun, 06 Sep 2026 12:00:00 +0200
 
