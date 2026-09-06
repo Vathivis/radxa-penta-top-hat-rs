@@ -261,6 +261,15 @@ impl Config {
             }
         }
 
+        for (key, seconds) in [
+            ("time.twice", config.time.twice),
+            ("time.press", config.time.press),
+            ("oled.auto_slide_time", config.oled.auto_slide_time),
+            ("oled.sleep", config.oled.sleep),
+        ] {
+            validate_timer(key, seconds)?;
+        }
+
         validate_fan_thresholds("fan", config.fan)?;
         validate_fan_thresholds("fan_drives", config.fan_drives.thresholds)?;
         validate_fan_curve(config.fan_curve)?;
@@ -355,6 +364,22 @@ fn parse_f64(section: &Section, key: &str, default: f64) -> Result<f64, ConfigEr
         value: value.clone(),
         expected: "number",
     })
+}
+
+fn validate_timer(key: &str, seconds: f64) -> Result<(), ConfigError> {
+    let valid = std::time::Duration::try_from_secs_f64(seconds)
+        .ok()
+        .and_then(|duration| std::time::Instant::now().checked_add(duration))
+        .is_some();
+    if valid {
+        Ok(())
+    } else {
+        Err(ConfigError::Value {
+            key: key.to_string(),
+            value: seconds.to_string(),
+            expected: "finite nonnegative seconds within the monotonic clock range",
+        })
+    }
 }
 
 fn parse_bool(section: &Section, key: &str, default: bool) -> Result<bool, ConfigError> {
@@ -578,6 +603,25 @@ impl std::error::Error for ConfigError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_invalid_timers_before_runtime_initialization() {
+        for (section, key) in [
+            ("time", "twice"),
+            ("time", "press"),
+            ("oled", "auto_slide_time"),
+            ("oled", "sleep"),
+        ] {
+            for value in ["inf", "-inf", "NaN", "-1", "1e300", "1e19"] {
+                let input = format!("[{section}]\n{key} = {value}\n");
+                let error = Config::parse(&input).unwrap_err();
+                assert!(error.to_string().contains(&format!("{section}.{key}")));
+            }
+            for value in ["0", "0.1", "60"] {
+                assert!(Config::parse(&format!("[{section}]\n{key} = {value}\n")).is_ok());
+            }
+        }
+    }
 
     #[test]
     fn defaults_match_python_fallbacks() {

@@ -233,6 +233,7 @@ pub struct ButtonClassifier {
     double_click: Duration,
     long_press: Duration,
     click_count: u8,
+    pressed_at: Option<Instant>,
     wait_until: Option<Instant>,
     ignore_release: bool,
 }
@@ -243,37 +244,32 @@ impl ButtonClassifier {
             double_click: duration_from_seconds(time_config.twice),
             long_press: duration_from_seconds(time_config.press),
             click_count: 0,
+            pressed_at: None,
             wait_until: None,
             ignore_release: false,
         }
     }
 
     pub fn handle_edge(&mut self, edge: ButtonEdge, now: Instant) -> Option<ButtonGesture> {
-        if self.wait_until.is_some_and(|wait_until| now >= wait_until) {
-            self.wait_until = None;
-
-            if self.click_count == 0 {
-                if edge != ButtonEdge::Released {
-                    self.ignore_release = true;
-                }
-                return Some(ButtonGesture::Press);
-            }
-
-            self.click_count = 0;
-            return Some(ButtonGesture::Click);
-        }
-
-        match edge {
+        // Resolve an expired click without discarding the arriving edge.
+        let expired = self.handle_timeout(now);
+        let gesture = match edge {
             ButtonEdge::Pressed => {
-                if self.click_count == 0 {
-                    self.wait_until = Some(now + self.long_press);
+                if self.pressed_at.is_none() {
+                    self.pressed_at = Some(now);
+                    let hold_deadline = now + self.long_press;
+                    self.wait_until = Some(
+                        self.wait_until
+                            .map_or(hold_deadline, |deadline| deadline.min(hold_deadline)),
+                    );
                 }
                 None
             }
             ButtonEdge::Released => {
+                self.pressed_at = None;
                 if self.ignore_release {
                     self.ignore_release = false;
-                    return None;
+                    return expired;
                 }
 
                 self.click_count = self.click_count.saturating_add(1);
@@ -286,7 +282,8 @@ impl ButtonClassifier {
                     Some(ButtonGesture::Twice)
                 }
             }
-        }
+        };
+        expired.or(gesture)
     }
 
     pub fn handle_timeout(&mut self, now: Instant) -> Option<ButtonGesture> {
@@ -296,11 +293,17 @@ impl ButtonClassifier {
 
         self.wait_until = None;
 
-        if self.click_count == 0 {
+        if self
+            .pressed_at
+            .is_some_and(|pressed| now >= pressed + self.long_press)
+        {
+            self.click_count = 0;
             self.ignore_release = true;
             Some(ButtonGesture::Press)
         } else {
             self.click_count = 0;
+            // The pending click can expire while a second press is still held.
+            self.wait_until = self.pressed_at.map(|pressed| pressed + self.long_press);
             Some(ButtonGesture::Click)
         }
     }
@@ -324,6 +327,53 @@ mod tests {
             twice: 0.7,
             press: 1.8,
         })
+    }
+
+    #[test]
+    fn click_followed_by_hold_preserves_long_press() {
+        for release_without_timeout in [false, true] {
+            let t = Instant::now();
+            let mut button = classifier();
+            button.handle_edge(ButtonEdge::Pressed, t);
+            button.handle_edge(ButtonEdge::Released, t + Duration::from_millis(100));
+            button.handle_edge(ButtonEdge::Pressed, t + Duration::from_millis(500));
+            assert_eq!(
+                button.handle_timeout(t + Duration::from_millis(800)),
+                Some(ButtonGesture::Click)
+            );
+            if release_without_timeout {
+                assert_eq!(
+                    button.handle_edge(ButtonEdge::Released, t + Duration::from_millis(2400)),
+                    Some(ButtonGesture::Press)
+                );
+            } else {
+                assert_eq!(
+                    button.handle_timeout(t + Duration::from_millis(2300)),
+                    Some(ButtonGesture::Press)
+                );
+                assert_eq!(
+                    button.handle_edge(ButtonEdge::Released, t + Duration::from_millis(2400)),
+                    None
+                );
+            }
+            assert_eq!(button.handle_timeout(t + Duration::from_secs(4)), None);
+        }
+    }
+
+    #[test]
+    fn press_arriving_after_click_deadline_starts_new_hold() {
+        let t = Instant::now();
+        let mut button = classifier();
+        button.handle_edge(ButtonEdge::Pressed, t);
+        button.handle_edge(ButtonEdge::Released, t + Duration::from_millis(100));
+        assert_eq!(
+            button.handle_edge(ButtonEdge::Pressed, t + Duration::from_millis(900)),
+            Some(ButtonGesture::Click)
+        );
+        assert_eq!(
+            button.handle_timeout(t + Duration::from_millis(2700)),
+            Some(ButtonGesture::Press)
+        );
     }
 
     #[test]

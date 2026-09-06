@@ -1,3 +1,11 @@
+radxa-penta-top-hat-rs (1.0.3) stable; urgency=medium
+
+  * Keep fan control available when the optional OLED device is missing.
+  * Recognize a long press following a click and preserve edges at click expiry.
+  * Reject invalid and overflowing timer values before hardware initialization.
+
+ -- Vathivis <vojtahumpl@seznam.cz>  Sun, 06 Sep 2026 12:00:00 +0200
+
 radxa-penta-top-hat-rs (1.0.2) stable; urgency=medium
 
   * Preserve recent drive temperatures across transient SMART polling failures.

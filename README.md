@@ -116,7 +116,9 @@ ramp_down = 5
 
 Boolean options accept `true`/`false`, `yes`/`no`, `on`/`off`, or `1`/`0`.
 Unknown configuration sections and keys are rejected at startup, as are
-unsupported button action names.
+unsupported button action names. Timer values must be finite, nonnegative, and
+representable as monotonic-clock deadlines. A missing OLED device disables only
+the display; fan control continues.
 With `[fan_curve]` disabled, the daemon uses the original stepped fan behavior;
 with `[fan_drives]` disabled, only CPU temperature controls the fan.
 
