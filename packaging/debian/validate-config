@@ -18,15 +18,8 @@ value() {
 
 [ -r "$env_file" ] || fail "cannot read $env_file"
 
-sda=$(value SDA)
-scl=$(value SCL)
-if [ -n "$sda" ] || [ -n "$scl" ]; then
-    [ -n "$sda" ] && [ -n "$scl" ] || fail "OLED requires both SDA and SCL"
-    i2c_device=$(value OLED_I2C_DEVICE)
-    [ -n "$i2c_device" ] || i2c_device=$(value I2C_DEVICE)
-    [ -n "$i2c_device" ] || i2c_device=/dev/i2c-1
-    [ -c "$i2c_device" ] || fail "OLED I2C device is unavailable: $i2c_device"
-fi
+# OLED initialization is optional and handled by the daemon after fan startup.
+# A missing display must not prevent cooling.
 
 hardware_pwm=$(value HARDWARE_PWM | tr '[:upper:]' '[:lower:]')
 case "$hardware_pwm" in
