@@ -17,7 +17,7 @@ use radxa_penta_top_hat_rs::oled::{OledRuntime, OledSignal};
 use radxa_penta_top_hat_rs::pwm::{Duty, FanOutput, FanPwmOutput};
 use radxa_penta_top_hat_rs::shutdown;
 use radxa_penta_top_hat_rs::smart::{
-    DriveTemperatureFailure, DriveTemperatureState, poll_drive_temperatures,
+    DriveTemperatureFailure, DriveTemperaturePoller, DriveTemperatureState,
 };
 use radxa_penta_top_hat_rs::temp::read_cpu_temp_c;
 
@@ -386,6 +386,8 @@ fn run() -> Result<(), String> {
     let drive_polling_enabled = config.fan_drives.enabled && !config.fan_drives.devices.is_empty();
     let drive_poll_interval = Duration::from_secs(config.fan_drives.poll_seconds);
     let drive_failure_grace = drive_poll_interval.saturating_mul(2);
+    let mut drive_temperature_poller =
+        drive_polling_enabled.then(|| DriveTemperaturePoller::new(&config.fan_drives.devices));
     let mut last_drive_poll = None;
     let mut hottest_drive_temp_c = None;
     let mut drive_temperature_state = DriveTemperatureState::default();
@@ -457,7 +459,10 @@ fn run() -> Result<(), String> {
                 .map(|last: Instant| last.elapsed() >= drive_poll_interval)
                 .unwrap_or(true)
         {
-            let poll = poll_drive_temperatures(&config.fan_drives.devices);
+            let poll = drive_temperature_poller
+                .as_mut()
+                .expect("drive poller must exist when drive polling is enabled")
+                .poll();
             let polled_at = Instant::now();
             last_drive_poll = Some(polled_at);
             polled_drives = true;
