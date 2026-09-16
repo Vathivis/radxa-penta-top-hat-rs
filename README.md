@@ -96,7 +96,9 @@ ramp_down = 5
   higher requested duty wins. A failed read retains that device's most recent
   temperature for two polling intervals. If no recent reading is available,
   the fan uses `max_duty` until the device reports a temperature or explicit
-  standby state.
+  standby state. Configured drives are queried in parallel, each `smartctl`
+  command may run for up to five seconds, and the batch collects results for up
+  to 6.7 seconds.
 - `[key]`: `click`, `twice`, and `press` assign actions to a single click,
   double click, and long press. Actions are `slider` (wake or next OLED page),
   `switch` (toggle fan control), `reboot`, `poweroff`, or `none`.
