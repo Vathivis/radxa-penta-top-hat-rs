@@ -99,7 +99,9 @@ ramp_down = 5
   standby state. Configured drives are queried in parallel by persistent
   single-flight workers. Each `smartctl` command and the parallel collection
   window use the same 6.7-second timeout. A worker that outlives that deadline
-  remains busy instead of starting overlapping commands for that drive.
+  remains busy instead of starting overlapping commands for that drive; its late
+  result is discarded and a fresh read starts once the worker is idle. Failed
+  worker starts are retried on later polls.
 - `[key]`: `click`, `twice`, and `press` assign actions to a single click,
   double click, and long press. Actions are `slider` (wake or next OLED page),
   `switch` (toggle fan control), `reboot`, `poweroff`, or `none`.

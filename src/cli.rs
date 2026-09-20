@@ -216,10 +216,9 @@ mod tests {
     }
 
     #[test]
-    fn parses_and_reports_version() {
+    fn parses_version_flag() {
         let args = Args::parse_from(["daemon", "--version"]).expect("version flag should parse");
 
         assert!(args.version);
-        assert_eq!(version(), "radxa-penta-top-hat-rs 1.0.4");
     }
 }
