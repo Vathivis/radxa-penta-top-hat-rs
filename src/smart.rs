@@ -6,7 +6,7 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const SMARTCTL_TIMEOUT: Duration = Duration::from_millis(6_700);
+const SMARTCTL_TIMEOUT: Duration = Duration::from_secs(15);
 const SMARTCTL_WAIT_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
