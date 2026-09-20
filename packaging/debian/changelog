@@ -1,11 +1,3 @@
-radxa-penta-top-hat-rs (1.0.4) stable; urgency=medium
-
-  * Poll drive temperatures in parallel with a 6.7-second SMART deadline.
-  * Retry fresh reads after late SMART results without overlapping commands.
-  * Recover from transient SMART worker startup failures.
-
- -- Vathivis <vojtahumpl@seznam.cz>  Sun, 20 Sep 2026 21:24:54 +0200
-
 radxa-penta-top-hat-rs (1.0.3) stable; urgency=medium
 
   * Keep fan control available when the optional OLED device is missing.

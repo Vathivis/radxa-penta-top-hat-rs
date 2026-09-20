@@ -151,7 +151,7 @@ service. An editable example is installed at
 ```bash
 git clone https://github.com/Vathivis/radxa-penta-top-hat-rs.git
 cd radxa-penta-top-hat-rs
-cargo build --locked --release
+cargo build --release
 ```
 
 Build the installable ARM64 Debian package with:
@@ -168,10 +168,11 @@ Debian package, and checksums) with:
 sh packaging/build-release.sh
 ```
 
-GitHub Actions runs formatting, tests, Clippy, and the ARM64 package build for
-pull requests and pushes to `main`. When the version in `Cargo.toml` increases
-on `main` and matches `Cargo.lock` plus the Debian changelog, it publishes the
-four artifacts as a `v<version>` GitHub release.
+GitHub Actions runs formatting, tests, and Clippy for pull requests and pushes
+to `main`. Bump the version in `Cargo.toml` and merge to `main` to build the
+ARM64 artifacts and publish a `v<version>` GitHub release. Release notes and
+the package changelog are generated from the merged commits; no manual
+changelog or `Cargo.lock` version edit is required.
 
 ## Logging and retention
 
