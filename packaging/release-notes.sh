@@ -6,15 +6,17 @@ repo_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
 cd "$repo_root"
 
 base_ref=${1:-}
+head_ref=${2:-HEAD}
 if [ -z "$base_ref" ]; then
-    base_ref=$(git describe --tags --abbrev=0 --match 'v[0-9]*' HEAD 2>/dev/null || true)
+    base_ref=$(git describe --tags --abbrev=0 --match 'v[0-9]*' "$head_ref" 2>/dev/null || true)
 fi
 
+git rev-parse --verify "${head_ref}^{commit}" >/dev/null
 if [ -n "$base_ref" ]; then
     git rev-parse --verify "${base_ref}^{commit}" >/dev/null
-    range="$base_ref..HEAD"
+    range="$base_ref..$head_ref"
 else
-    range=HEAD
+    range=$head_ref
 fi
 
 git log --no-merges --reverse --format=%s "$range" |

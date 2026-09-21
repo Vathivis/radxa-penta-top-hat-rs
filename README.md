@@ -97,11 +97,13 @@ ramp_down = 5
   temperature for two polling intervals. If no recent reading is available,
   the fan uses `max_duty` until the device reports a temperature or explicit
   standby state. Configured drives are queried in parallel by persistent
-  single-flight workers. Each `smartctl` command and the parallel collection
-  window use the same 15-second timeout. A worker that outlives that deadline
-  remains busy instead of starting overlapping commands for that drive; its late
-  result is discarded and a fresh read starts once the worker is idle. Failed
-  worker starts are retried on later polls.
+  single-flight workers. Each `smartctl` command has a 15-second timeout; the
+  parallel collection window starts after dispatch and adds one second of
+  completion headroom. Collection waits check for shutdown at least every 100
+  milliseconds. A worker that outlives the collection deadline remains busy
+  instead of starting overlapping commands for that drive; its late result is
+  discarded and a fresh read starts once the worker is idle. Failed worker
+  starts are retried on later polls.
 - `[key]`: `click`, `twice`, and `press` assign actions to a single click,
   double click, and long press. Actions are `slider` (wake or next OLED page),
   `switch` (toggle fan control), `reboot`, `poweroff`, or `none`.

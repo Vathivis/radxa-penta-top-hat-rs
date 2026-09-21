@@ -462,7 +462,10 @@ fn run() -> Result<(), String> {
             let poll = drive_temperature_poller
                 .as_mut()
                 .expect("drive poller must exist when drive polling is enabled")
-                .poll();
+                .poll_interruptible(shutdown::requested);
+            let Some(poll) = poll else {
+                break;
+            };
             let polled_at = Instant::now();
             last_drive_poll = Some(polled_at);
             polled_drives = true;

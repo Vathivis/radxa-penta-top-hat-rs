@@ -58,19 +58,10 @@ install -m 0644 README.md "$docs/README.md"
 gzip -9n "$docs/README.md"
 install -m 0644 LICENSE "$docs/copyright"
 install -m 0644 THIRD_PARTY_LICENSES.md "$docs/THIRD_PARTY_LICENSES.md"
-{
-    printf '%s (%s) stable; urgency=medium\n\n' "$package" "$version"
-    sh "$repo_root/packaging/release-notes.sh" "${RELEASE_BASE_REF:-}" |
-        sed 's/^- /  * /'
-    printf '\n -- Vathivis <vojtahumpl@seznam.cz>  %s\n' \
-        "$(date -u -R -d "@$source_date_epoch")"
-
-    archived_version=$(sed -n "1s/^${package} (\([^)]*\)) .*/\1/p" "$script_dir/changelog")
-    if [ "$archived_version" != "$version" ]; then
-        printf '\n'
-        sed -n '1,$p' "$script_dir/changelog"
-    fi
-} > "$docs/changelog.Debian"
+sh "$script_dir/generate-changelog.sh" \
+    "$version" \
+    "$source_date_epoch" \
+    "${RELEASE_BASE_REF:-}" > "$docs/changelog.Debian"
 gzip -9n "$docs/changelog.Debian"
 
 install -m 0644 "$script_dir/conffiles" "$root/DEBIAN/conffiles"
