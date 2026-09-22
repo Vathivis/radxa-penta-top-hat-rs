@@ -102,8 +102,8 @@ ramp_down = 5
   completion headroom. Collection waits check for shutdown at least every 100
   milliseconds. A worker that outlives the collection deadline remains busy
   instead of starting overlapping commands for that drive; its late result is
-  discarded and a fresh read starts once the worker is idle. Failed worker
-  starts are retried on later polls.
+  discarded and a fresh read starts at the next poll where the worker is idle,
+  with a full collection window. Failed worker starts are retried on later polls.
 - `[key]`: `click`, `twice`, and `press` assign actions to a single click,
   double click, and long press. Actions are `slider` (wake or next OLED page),
   `switch` (toggle fan control), `reboot`, `poweroff`, or `none`.
@@ -174,7 +174,9 @@ GitHub Actions runs formatting, tests, and Clippy for pull requests and pushes
 to `main`. Bump the version in `Cargo.toml` and merge to `main` to build the
 ARM64 artifacts and publish a `v<version>` GitHub release. Release notes and
 the package changelog are generated from the merged commits; no manual
-changelog or `Cargo.lock` version edit is required.
+changelog or `Cargo.lock` version edit is required. Historical package changelog
+entries are reconstructed for tagged releases; untagged intermediate version
+bumps do not block packaging or create entries for unpublished releases.
 
 ## Logging and retention
 

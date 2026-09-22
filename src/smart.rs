@@ -337,7 +337,13 @@ impl DriveTemperaturePoller {
         self.dispatch_ready_workers(request_id, &mut results);
         let deadline = Instant::now() + self.batch_timeout;
 
-        while results.iter().any(Option::is_none) {
+        // Only collect reads dispatched at the start of this poll. A previous
+        // read that finishes late must wait for the next poll's full window.
+        while self
+            .workers
+            .iter()
+            .any(|worker| worker.in_flight == Some(request_id))
+        {
             if cancel_requested() {
                 return None;
             }
@@ -353,7 +359,6 @@ impl DriveTemperaturePoller {
             {
                 Ok(result) => {
                     self.record_result(result, request_id, &mut results);
-                    self.dispatch_ready_workers(request_id, &mut results);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -1302,6 +1307,7 @@ ID# ATTRIBUTE_NAME          FLAG     VALUE WORST THRESH TYPE      UPDATED  WHEN_
         assert_eq!(second.failures.len(), 1);
 
         release.store(true, Ordering::SeqCst);
+        queue_finished_worker_result(&poller);
         let recovered = poller.poll();
 
         assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -1343,11 +1349,78 @@ ID# ATTRIBUTE_NAME          FLAG     VALUE WORST THRESH TYPE      UPDATED  WHEN_
         assert_eq!(first.failures.len(), 1);
 
         release.store(true, Ordering::SeqCst);
+        queue_finished_worker_result(&poller);
         let second = poller.poll();
 
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert!(second.failures.is_empty());
         assert_eq!(second.readings[0].temperature.current_celsius, 45);
+    }
+
+    fn queue_finished_worker_result(poller: &DriveTemperaturePoller) {
+        // Ensure the worker's late outcome is queued before the next poll,
+        // without relying on a sleep or racing the worker's result send.
+        let result = poller
+            .result_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        poller.result_sender.send(result).unwrap();
+    }
+
+    #[test]
+    fn late_completion_defers_replacement_until_next_poll() {
+        use std::cell::Cell;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let worker_calls = Arc::clone(&calls);
+        let mut poller = DriveTemperaturePoller::with_reader(
+            &["/dev/sdc".to_string(), "/dev/sdd".to_string()],
+            Duration::from_secs(1),
+            move |device| -> Result<SmartctlOutcome, &str> {
+                if device == "/dev/sdc" {
+                    worker_calls.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(SmartctlOutcome::Temperature(DriveTemperature {
+                    current_celsius: 45,
+                    source: SmartTemperatureSource::JsonTemperatureCurrent,
+                }))
+            },
+        );
+
+        // Model an earlier request completing just after the pre-poll drain.
+        // Queue it before sdd's result so it is consumed during collection.
+        poller.workers[0].in_flight = Some(u64::MAX);
+        let result_sender = poller.result_sender.clone();
+        let late_result = Cell::new(Some(DriveWorkerResult {
+            index: 0,
+            request_id: u64::MAX,
+            outcome: Ok(SmartctlOutcome::Temperature(DriveTemperature {
+                current_celsius: 60,
+                source: SmartTemperatureSource::JsonTemperatureCurrent,
+            })),
+        }));
+        let deferred = poller
+            .poll_interruptible(|| {
+                if let Some(result) = late_result.take() {
+                    result_sender.send(result).unwrap();
+                }
+                false
+            })
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(deferred.failures.len(), 1);
+        assert_eq!(deferred.failures[0].device, "/dev/sdc");
+        assert_eq!(deferred.readings.len(), 1);
+        assert_eq!(deferred.readings[0].device, "/dev/sdd");
+        assert_eq!(poller.workers[0].in_flight, None);
+
+        let recovered = poller.poll();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(recovered.failures.is_empty());
+        assert_eq!(recovered.readings.len(), 2);
+        assert_eq!(recovered.readings[0].temperature.current_celsius, 45);
     }
 
     #[test]

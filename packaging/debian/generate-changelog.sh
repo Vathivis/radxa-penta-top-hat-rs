@@ -42,13 +42,6 @@ for commit in $(git rev-list --first-parent --reverse HEAD -- Cargo.toml); do
     fi
 done
 
-if [ -z "$current_base_ref" ]; then
-    current_first_ref=$(awk -v version="$version" '$1 == version { print $2; exit }' "$history")
-    if [ -n "$current_first_ref" ]; then
-        current_base_ref=$(git rev-parse "${current_first_ref}^{commit}^")
-    fi
-fi
-
 write_entry() {
     entry_version=$1
     base_ref=$2
@@ -61,40 +54,51 @@ write_entry() {
         "$(date -u -R -d "@$entry_epoch")"
 }
 
-write_entry "$version" "$current_base_ref" HEAD "$source_date_epoch"
-
+# Walk forward so skipped, unpublished bumps remain in the next release's
+# commit range instead of becoming artificial changelog boundaries.
+previous_release_ref=
+if git merge-base --is-ancestor "v${archived_version}" HEAD 2>/dev/null; then
+    previous_release_ref="v${archived_version}"
+fi
 : > "$intermediate"
 while read -r historical_version first_ref; do
-    if dpkg --compare-versions "$historical_version" gt "$archived_version" &&
-        dpkg --compare-versions "$historical_version" lt "$version"
-    then
-        printf '%s %s\n' "$historical_version" "$first_ref" >> "$intermediate"
+    if ! dpkg --compare-versions "$historical_version" gt "$archived_version" ||
+        ! dpkg --compare-versions "$historical_version" lt "$version"; then
+        continue
     fi
-done < "$history"
+    if [ -z "$previous_release_ref" ]; then
+        previous_release_ref=$(git rev-parse "${first_ref}^{commit}^")
+    fi
 
-awk '{ lines[NR] = $0 } END { for (line = NR; line >= 1; line--) print lines[line] }' \
-    "$intermediate" > "$intermediate_desc"
-
-while read -r historical_version first_ref; do
-    [ -n "$historical_version" ] || continue
     tag="v${historical_version}"
     if ! git rev-parse --verify "${tag}^{commit}" >/dev/null 2>&1; then
-        printf 'Missing tag %s required to reconstruct Debian changelog history\n' "$tag" >&2
-        exit 1
+        continue
     fi
     if ! git merge-base --is-ancestor "$tag" HEAD; then
         printf 'Tag %s is not an ancestor of the release commit\n' "$tag" >&2
         exit 1
     fi
 
-    prior_version=$(
-        awk -v version="$historical_version" \
-            '$1 == version { print previous; exit } { previous = $1 }' "$history"
-    )
-    prior_ref="v${prior_version}"
-    if ! git rev-parse --verify "${prior_ref}^{commit}" >/dev/null 2>&1; then
-        prior_ref=$(git rev-parse "${first_ref}^{commit}^")
+    printf '%s %s %s\n' "$historical_version" "$previous_release_ref" "$tag" >> "$intermediate"
+    previous_release_ref=$tag
+done < "$history"
+
+if [ -z "$current_base_ref" ]; then
+    current_base_ref=$previous_release_ref
+    if [ -z "$current_base_ref" ]; then
+        current_first_ref=$(awk -v version="$version" '$1 == version { print $2; exit }' "$history")
+        if [ -n "$current_first_ref" ]; then
+            current_base_ref=$(git rev-parse "${current_first_ref}^{commit}^")
+        fi
     fi
+fi
+
+write_entry "$version" "$current_base_ref" HEAD "$source_date_epoch"
+
+awk '{ lines[NR] = $0 } END { for (line = NR; line >= 1; line--) print lines[line] }' \
+    "$intermediate" > "$intermediate_desc"
+
+while read -r historical_version prior_ref tag; do
     tag_epoch=$(git show -s --format=%ct "${tag}^{commit}")
 
     printf '\n'
