@@ -2,11 +2,15 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const SMARTCTL_BATCH_TIMEOUT: Duration = Duration::from_secs(5);
+const SMARTCTL_TIMEOUT_SECONDS: u64 = 15;
+const SMARTCTL_TIMEOUT: Duration = Duration::from_secs(SMARTCTL_TIMEOUT_SECONDS);
+const SMART_BATCH_TIMEOUT: Duration = Duration::from_secs(SMARTCTL_TIMEOUT_SECONDS + 1);
 const SMARTCTL_WAIT_INTERVAL: Duration = Duration::from_millis(10);
+const SMART_RESULT_WAIT_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct DriveTemperature {
@@ -134,7 +138,7 @@ impl DriveTemperatureState {
 }
 
 pub fn read_smart_temperature(device: &str) -> Result<SmartctlOutcome, SmartctlError> {
-    read_smart_temperature_with_timeout(device, SMARTCTL_BATCH_TIMEOUT)
+    read_smart_temperature_with_timeout(device, SMARTCTL_TIMEOUT)
 }
 
 fn read_smart_temperature_with_timeout(
@@ -195,43 +199,290 @@ fn classify_smartctl_output(
     Err(SmartctlError::NoTemperature { status, detail })
 }
 
-pub fn poll_drive_temperatures(devices: &[String]) -> DriveTemperaturePoll {
-    let deadline = Instant::now() + SMARTCTL_BATCH_TIMEOUT;
+type DriveWorkerOutcome = Result<SmartctlOutcome, String>;
+type DriveTemperatureReader = dyn Fn(&str) -> DriveWorkerOutcome + Send + Sync;
 
-    poll_drive_temperatures_with(devices, |device| {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            Err(SmartctlError::BatchTimeout)
-        } else {
-            read_smart_temperature_with_timeout(device, remaining)
-        }
-    })
+struct DriveWorkerResult {
+    index: usize,
+    request_id: u64,
+    outcome: DriveWorkerOutcome,
 }
 
-fn poll_drive_temperatures_with<F, E>(devices: &[String], mut read: F) -> DriveTemperaturePoll
-where
-    F: FnMut(&str) -> Result<SmartctlOutcome, E>,
-    E: fmt::Display,
-{
-    let mut poll = DriveTemperaturePoll::default();
+struct DriveTemperatureWorker {
+    device: String,
+    request_sender: Option<mpsc::SyncSender<u64>>,
+    in_flight: Option<u64>,
+    spawn_error: Option<String>,
+    handle: Option<thread::JoinHandle<()>>,
+}
 
-    for device in devices {
-        match read(device) {
-            Ok(SmartctlOutcome::Temperature(temperature)) => {
-                poll.readings.push(DriveTemperatureReading {
-                    device: device.clone(),
-                    temperature,
-                })
+pub struct DriveTemperaturePoller {
+    workers: Vec<DriveTemperatureWorker>,
+    result_sender: mpsc::Sender<DriveWorkerResult>,
+    result_receiver: mpsc::Receiver<DriveWorkerResult>,
+    read: Arc<DriveTemperatureReader>,
+    batch_timeout: Duration,
+    next_request_id: u64,
+}
+
+fn spawn_drive_worker(
+    index: usize,
+    device: String,
+    read: Arc<DriveTemperatureReader>,
+    result_sender: mpsc::Sender<DriveWorkerResult>,
+) -> Result<(mpsc::SyncSender<u64>, thread::JoinHandle<()>), String> {
+    let (request_sender, request_receiver) = mpsc::sync_channel(1);
+    let handle = thread::Builder::new()
+        .name(format!("smartctl-{index}"))
+        .spawn(move || {
+            while let Ok(request_id) = request_receiver.recv() {
+                let outcome = read(&device);
+                if result_sender
+                    .send(DriveWorkerResult {
+                        index,
+                        request_id,
+                        outcome,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
             }
-            Ok(SmartctlOutcome::Standby) => poll.standby_devices.push(device.clone()),
-            Err(err) => poll.failures.push(DriveTemperatureFailure {
-                device: device.clone(),
-                error: err.to_string(),
-            }),
+        })
+        .map_err(|err| format!("failed to start SMART worker: {err}"))?;
+    Ok((request_sender, handle))
+}
+
+impl DriveTemperaturePoller {
+    pub fn new(devices: &[String]) -> Self {
+        Self::with_reader(devices, SMART_BATCH_TIMEOUT, |device| {
+            read_smart_temperature_with_timeout(device, SMARTCTL_TIMEOUT)
+        })
+    }
+
+    fn with_reader<F, E>(devices: &[String], batch_timeout: Duration, read: F) -> Self
+    where
+        F: Fn(&str) -> Result<SmartctlOutcome, E> + Send + Sync + 'static,
+        E: fmt::Display + Send + 'static,
+    {
+        let read: Arc<DriveTemperatureReader> =
+            Arc::new(move |device| read(device).map_err(|err| err.to_string()));
+        let (result_sender, result_receiver) = mpsc::channel();
+        let mut workers = Vec::with_capacity(devices.len());
+
+        for (index, device) in devices.iter().cloned().enumerate() {
+            let spawn_result = spawn_drive_worker(
+                index,
+                device.clone(),
+                Arc::clone(&read),
+                result_sender.clone(),
+            );
+
+            match spawn_result {
+                Ok((request_sender, handle)) => workers.push(DriveTemperatureWorker {
+                    device,
+                    request_sender: Some(request_sender),
+                    in_flight: None,
+                    spawn_error: None,
+                    handle: Some(handle),
+                }),
+                Err(err) => workers.push(DriveTemperatureWorker {
+                    device,
+                    request_sender: None,
+                    in_flight: None,
+                    spawn_error: Some(err),
+                    handle: None,
+                }),
+            }
+        }
+
+        Self {
+            workers,
+            result_sender,
+            result_receiver,
+            read,
+            batch_timeout,
+            next_request_id: 0,
         }
     }
 
-    poll
+    pub fn poll(&mut self) -> DriveTemperaturePoll {
+        self.poll_with_cancel(|| false)
+            .expect("an unconditional SMART poll cannot be cancelled")
+    }
+
+    pub fn poll_interruptible<F>(&mut self, cancel_requested: F) -> Option<DriveTemperaturePoll>
+    where
+        F: Fn() -> bool,
+    {
+        self.poll_with_cancel(cancel_requested)
+    }
+
+    fn poll_with_cancel<F>(&mut self, cancel_requested: F) -> Option<DriveTemperaturePoll>
+    where
+        F: Fn() -> bool,
+    {
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+        let mut results = (0..self.workers.len()).map(|_| None).collect::<Vec<_>>();
+
+        while let Ok(result) = self.result_receiver.try_recv() {
+            self.record_result(result, request_id, &mut results);
+        }
+
+        self.retry_failed_workers();
+        if cancel_requested() {
+            return None;
+        }
+        self.dispatch_ready_workers(request_id, &mut results);
+        let deadline = Instant::now() + self.batch_timeout;
+
+        // Only collect reads dispatched at the start of this poll. A previous
+        // read that finishes late must wait for the next poll's full window.
+        while self
+            .workers
+            .iter()
+            .any(|worker| worker.in_flight == Some(request_id))
+        {
+            if cancel_requested() {
+                return None;
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+
+            match self
+                .result_receiver
+                .recv_timeout(remaining.min(SMART_RESULT_WAIT_INTERVAL))
+            {
+                Ok(result) => {
+                    self.record_result(result, request_id, &mut results);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+
+        if cancel_requested() {
+            return None;
+        }
+
+        let mut poll = DriveTemperaturePoll::default();
+        for (worker, result) in self.workers.iter().zip(results) {
+            let device = worker.device.clone();
+            match result.unwrap_or_else(|| Err(SmartctlError::BatchTimeout.to_string())) {
+                Ok(SmartctlOutcome::Temperature(temperature)) => {
+                    poll.readings.push(DriveTemperatureReading {
+                        device,
+                        temperature,
+                    })
+                }
+                Ok(SmartctlOutcome::Standby) => poll.standby_devices.push(device),
+                Err(error) => poll
+                    .failures
+                    .push(DriveTemperatureFailure { device, error }),
+            }
+        }
+
+        Some(poll)
+    }
+
+    fn retry_failed_workers(&mut self) {
+        for (index, worker) in self.workers.iter_mut().enumerate() {
+            if worker.spawn_error.is_none() {
+                continue;
+            }
+
+            if let Some(handle) = worker.handle.take() {
+                let _ = handle.join();
+            }
+            match spawn_drive_worker(
+                index,
+                worker.device.clone(),
+                Arc::clone(&self.read),
+                self.result_sender.clone(),
+            ) {
+                Ok((request_sender, handle)) => {
+                    worker.request_sender = Some(request_sender);
+                    worker.spawn_error = None;
+                    worker.handle = Some(handle);
+                }
+                Err(err) => worker.spawn_error = Some(err),
+            }
+        }
+    }
+
+    fn dispatch_ready_workers(
+        &mut self,
+        request_id: u64,
+        results: &mut [Option<DriveWorkerOutcome>],
+    ) {
+        for (index, worker) in self.workers.iter_mut().enumerate() {
+            if results[index].is_some() || worker.in_flight.is_some() {
+                continue;
+            }
+            if let Some(err) = &worker.spawn_error {
+                results[index] = Some(Err(err.clone()));
+                continue;
+            }
+
+            let Some(request_sender) = &worker.request_sender else {
+                results[index] = Some(Err("SMART worker is unavailable".to_string()));
+                continue;
+            };
+            match request_sender.try_send(request_id) {
+                Ok(()) => worker.in_flight = Some(request_id),
+                Err(mpsc::TrySendError::Full(_)) => {
+                    results[index] = Some(Err("SMART worker queue unexpectedly full".to_string()));
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    let error = "SMART worker stopped unexpectedly".to_string();
+                    worker.request_sender.take();
+                    if let Some(handle) = worker.handle.take() {
+                        let _ = handle.join();
+                    }
+                    worker.spawn_error = Some(error.clone());
+                    results[index] = Some(Err(error));
+                }
+            }
+        }
+    }
+
+    fn record_result(
+        &mut self,
+        result: DriveWorkerResult,
+        request_id: u64,
+        results: &mut [Option<DriveWorkerOutcome>],
+    ) {
+        if let (Some(worker), Some(slot)) = (
+            self.workers.get_mut(result.index),
+            results.get_mut(result.index),
+        ) && worker.in_flight == Some(result.request_id)
+        {
+            worker.in_flight = None;
+            if result.request_id == request_id {
+                *slot = Some(result.outcome);
+            }
+        }
+    }
+}
+
+impl Drop for DriveTemperaturePoller {
+    fn drop(&mut self) {
+        for worker in &mut self.workers {
+            worker.request_sender.take();
+        }
+
+        for worker in &mut self.workers {
+            if worker.in_flight.is_none()
+                && let Some(handle) = worker.handle.take()
+            {
+                let _ = handle.join();
+            }
+        }
+    }
 }
 
 fn first_nonempty_line(input: &str) -> Option<String> {
@@ -883,18 +1134,22 @@ ID# ATTRIBUTE_NAME          FLAG     VALUE WORST THRESH TYPE      UPDATED  WHEN_
             "/dev/sdd".to_string(),
             "/dev/sde".to_string(),
         ];
-        let poll = poll_drive_temperatures_with(&devices, |device| match device {
-            "/dev/sdc" => Ok(SmartctlOutcome::Temperature(DriveTemperature {
-                current_celsius: 41,
-                source: SmartTemperatureSource::JsonTemperatureCurrent,
-            })),
-            "/dev/sdd" => Err("drive is in standby"),
-            "/dev/sde" => Ok(SmartctlOutcome::Temperature(DriveTemperature {
-                current_celsius: 47,
-                source: SmartTemperatureSource::JsonTemperatureCurrent,
-            })),
-            _ => unreachable!(),
-        });
+        let mut poller =
+            DriveTemperaturePoller::with_reader(&devices, Duration::from_secs(1), |device| {
+                match device {
+                    "/dev/sdc" => Ok(SmartctlOutcome::Temperature(DriveTemperature {
+                        current_celsius: 41,
+                        source: SmartTemperatureSource::JsonTemperatureCurrent,
+                    })),
+                    "/dev/sdd" => Err("drive is in standby"),
+                    "/dev/sde" => Ok(SmartctlOutcome::Temperature(DriveTemperature {
+                        current_celsius: 47,
+                        source: SmartTemperatureSource::JsonTemperatureCurrent,
+                    })),
+                    _ => unreachable!(),
+                }
+            });
+        let poll = poller.poll();
 
         assert_eq!(poll.readings.len(), 2);
         assert_eq!(poll.failures.len(), 1);
@@ -906,8 +1161,11 @@ ID# ATTRIBUTE_NAME          FLAG     VALUE WORST THRESH TYPE      UPDATED  WHEN_
     #[test]
     fn all_failed_drive_reads_produce_no_hottest_temperature() {
         let devices = vec!["/dev/sdc".to_string(), "/dev/sdd".to_string()];
-        let poll =
-            poll_drive_temperatures_with(&devices, |_| Err::<SmartctlOutcome, _>("unavailable"));
+        let mut poller =
+            DriveTemperaturePoller::with_reader(&devices, Duration::from_secs(1), |_| {
+                Err::<SmartctlOutcome, _>("unavailable")
+            });
+        let poll = poller.poll();
 
         assert!(poll.readings.is_empty());
         assert_eq!(poll.failures.len(), 2);
@@ -917,13 +1175,277 @@ ID# ATTRIBUTE_NAME          FLAG     VALUE WORST THRESH TYPE      UPDATED  WHEN_
     #[test]
     fn standby_drives_are_excluded_without_becoming_failures() {
         let devices = vec!["/dev/sdc".to_string(), "/dev/sdd".to_string()];
-        let poll =
-            poll_drive_temperatures_with(&devices, |_| Ok::<_, &str>(SmartctlOutcome::Standby));
+        let mut poller =
+            DriveTemperaturePoller::with_reader(&devices, Duration::from_secs(1), |_| {
+                Ok::<_, &str>(SmartctlOutcome::Standby)
+            });
+        let poll = poller.poll();
 
         assert!(poll.readings.is_empty());
         assert!(poll.failures.is_empty());
         assert_eq!(poll.standby_devices, devices);
         assert!(poll.hottest().is_none());
+    }
+
+    #[test]
+    fn polls_configured_drives_in_parallel_and_preserves_order() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let devices = vec![
+            "/dev/sdc".to_string(),
+            "/dev/sdd".to_string(),
+            "/dev/sde".to_string(),
+            "/dev/sdf".to_string(),
+        ];
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let worker_active = Arc::clone(&active);
+        let worker_peak = Arc::clone(&peak);
+
+        let mut poller = DriveTemperaturePoller::with_reader(
+            &devices,
+            Duration::from_secs(1),
+            move |_| -> Result<SmartctlOutcome, &str> {
+                let current = worker_active.fetch_add(1, Ordering::SeqCst) + 1;
+                worker_peak.fetch_max(current, Ordering::SeqCst);
+                thread::sleep(Duration::from_millis(20));
+                worker_active.fetch_sub(1, Ordering::SeqCst);
+                Ok(SmartctlOutcome::Temperature(DriveTemperature {
+                    current_celsius: 42,
+                    source: SmartTemperatureSource::JsonTemperatureCurrent,
+                }))
+            },
+        );
+        let poll = poller.poll();
+
+        assert!(peak.load(Ordering::SeqCst) > 1);
+        assert_eq!(
+            poll.readings
+                .iter()
+                .map(|reading| reading.device.as_str())
+                .collect::<Vec<_>>(),
+            ["/dev/sdc", "/dev/sdd", "/dev/sde", "/dev/sdf"]
+        );
+    }
+
+    #[test]
+    fn production_batch_timeout_includes_command_completion_headroom() {
+        let poller = DriveTemperaturePoller::new(&[]);
+
+        assert_eq!(poller.batch_timeout, SMART_BATCH_TIMEOUT);
+        assert!(SMART_BATCH_TIMEOUT > SMARTCTL_TIMEOUT);
+    }
+
+    #[test]
+    fn interruptible_poll_returns_before_the_batch_deadline() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let release = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let worker_release = Arc::clone(&release);
+        let worker_finished = Arc::clone(&finished);
+        let mut poller = DriveTemperaturePoller::with_reader(
+            &["/dev/sdc".to_string()],
+            Duration::from_secs(1),
+            move |_| -> Result<SmartctlOutcome, &str> {
+                while !worker_release.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                worker_finished.store(true, Ordering::SeqCst);
+                Ok(SmartctlOutcome::Temperature(DriveTemperature {
+                    current_celsius: 42,
+                    source: SmartTemperatureSource::JsonTemperatureCurrent,
+                }))
+            },
+        );
+        let cancel_at = Instant::now() + Duration::from_millis(20);
+        let started = Instant::now();
+
+        let poll = poller.poll_interruptible(|| Instant::now() >= cancel_at);
+        let elapsed = started.elapsed();
+        release.store(true, Ordering::SeqCst);
+
+        assert!(poll.is_none());
+        assert!(elapsed < Duration::from_millis(500));
+
+        let finish_deadline = Instant::now() + Duration::from_secs(1);
+        while !finished.load(Ordering::SeqCst) && Instant::now() < finish_deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(finished.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn timed_out_worker_stays_single_flight_until_it_finishes() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let devices = vec!["/dev/sdc".to_string()];
+        let calls = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let worker_calls = Arc::clone(&calls);
+        let worker_release = Arc::clone(&release);
+        let mut poller = DriveTemperaturePoller::with_reader(
+            &devices,
+            Duration::from_millis(20),
+            move |_| -> Result<SmartctlOutcome, &str> {
+                let call = worker_calls.fetch_add(1, Ordering::SeqCst);
+                while !worker_release.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Ok(SmartctlOutcome::Temperature(DriveTemperature {
+                    current_celsius: 41 + call as i32,
+                    source: SmartTemperatureSource::JsonTemperatureCurrent,
+                }))
+            },
+        );
+
+        let first = poller.poll();
+        let second = poller.poll();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(first.failures.len(), 1);
+        assert_eq!(second.failures.len(), 1);
+
+        release.store(true, Ordering::SeqCst);
+        queue_finished_worker_result(&poller);
+        let recovered = poller.poll();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(recovered.readings.len(), 1);
+        assert_eq!(recovered.readings[0].temperature.current_celsius, 42);
+
+        let next = poller.poll();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(next.readings.len(), 1);
+    }
+
+    #[test]
+    fn late_timeout_result_does_not_replace_a_fresh_read() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let worker_calls = Arc::clone(&calls);
+        let worker_release = Arc::clone(&release);
+        let mut poller = DriveTemperaturePoller::with_reader(
+            &["/dev/sdc".to_string()],
+            Duration::from_millis(20),
+            move |_| -> Result<SmartctlOutcome, &str> {
+                if worker_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    while !worker_release.load(Ordering::SeqCst) {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    return Err("late timeout");
+                }
+                Ok(SmartctlOutcome::Temperature(DriveTemperature {
+                    current_celsius: 45,
+                    source: SmartTemperatureSource::JsonTemperatureCurrent,
+                }))
+            },
+        );
+
+        let first = poller.poll();
+        assert_eq!(first.failures.len(), 1);
+
+        release.store(true, Ordering::SeqCst);
+        queue_finished_worker_result(&poller);
+        let second = poller.poll();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(second.failures.is_empty());
+        assert_eq!(second.readings[0].temperature.current_celsius, 45);
+    }
+
+    fn queue_finished_worker_result(poller: &DriveTemperaturePoller) {
+        // Ensure the worker's late outcome is queued before the next poll,
+        // without relying on a sleep or racing the worker's result send.
+        let result = poller
+            .result_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        poller.result_sender.send(result).unwrap();
+    }
+
+    #[test]
+    fn late_completion_defers_replacement_until_next_poll() {
+        use std::cell::Cell;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let worker_calls = Arc::clone(&calls);
+        let mut poller = DriveTemperaturePoller::with_reader(
+            &["/dev/sdc".to_string(), "/dev/sdd".to_string()],
+            Duration::from_secs(1),
+            move |device| -> Result<SmartctlOutcome, &str> {
+                if device == "/dev/sdc" {
+                    worker_calls.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(SmartctlOutcome::Temperature(DriveTemperature {
+                    current_celsius: 45,
+                    source: SmartTemperatureSource::JsonTemperatureCurrent,
+                }))
+            },
+        );
+
+        // Model an earlier request completing just after the pre-poll drain.
+        // Queue it before sdd's result so it is consumed during collection.
+        poller.workers[0].in_flight = Some(u64::MAX);
+        let result_sender = poller.result_sender.clone();
+        let late_result = Cell::new(Some(DriveWorkerResult {
+            index: 0,
+            request_id: u64::MAX,
+            outcome: Ok(SmartctlOutcome::Temperature(DriveTemperature {
+                current_celsius: 60,
+                source: SmartTemperatureSource::JsonTemperatureCurrent,
+            })),
+        }));
+        let deferred = poller
+            .poll_interruptible(|| {
+                if let Some(result) = late_result.take() {
+                    result_sender.send(result).unwrap();
+                }
+                false
+            })
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(deferred.failures.len(), 1);
+        assert_eq!(deferred.failures[0].device, "/dev/sdc");
+        assert_eq!(deferred.readings.len(), 1);
+        assert_eq!(deferred.readings[0].device, "/dev/sdd");
+        assert_eq!(poller.workers[0].in_flight, None);
+
+        let recovered = poller.poll();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(recovered.failures.is_empty());
+        assert_eq!(recovered.readings.len(), 2);
+        assert_eq!(recovered.readings[0].temperature.current_celsius, 45);
+    }
+
+    #[test]
+    fn failed_worker_is_recreated_on_a_later_poll() {
+        let mut poller = DriveTemperaturePoller::with_reader(
+            &["/dev/sdc".to_string()],
+            Duration::from_secs(1),
+            |_| -> Result<SmartctlOutcome, &str> {
+                Ok(SmartctlOutcome::Temperature(DriveTemperature {
+                    current_celsius: 43,
+                    source: SmartTemperatureSource::JsonTemperatureCurrent,
+                }))
+            },
+        );
+
+        let worker = &mut poller.workers[0];
+        worker.request_sender.take();
+        worker.handle.take().unwrap().join().unwrap();
+        worker.spawn_error = Some("simulated transient startup failure".to_string());
+
+        let poll = poller.poll();
+
+        assert!(poller.workers[0].spawn_error.is_none());
+        assert!(poll.failures.is_empty());
+        assert_eq!(poll.readings[0].temperature.current_celsius, 43);
     }
 
     #[test]

@@ -16,7 +16,7 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
 cd "$repo_root"
 
-version=$(sh "$script_dir/check-version.sh")
+version=$(sh "$script_dir/read-version.sh")
 target_dir=${CARGO_TARGET_DIR:-$repo_root/target/debian-build-v$version}
 dist_dir=${DIST_DIR:-$repo_root/dist}
 

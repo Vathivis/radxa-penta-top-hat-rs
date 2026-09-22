@@ -16,17 +16,14 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH= cd -- "$script_dir/../.." && pwd)
 cd "$repo_root"
 
-version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | sed -n '1p')
-[ -n "$version" ] || {
-    printf 'Could not read the package version from Cargo.toml\n' >&2
-    exit 1
-}
+version=$(sh "$repo_root/packaging/read-version.sh")
+source_date_epoch=${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct 2>/dev/null || date +%s)}
 
 target_dir=${CARGO_TARGET_DIR:-$repo_root/target/debian-build-v$version}
 dist_dir=${DIST_DIR:-$repo_root/dist}
 export CARGO_TARGET_DIR=$target_dir
 
-cargo build --locked --release --target "$target"
+cargo build --release --target "$target"
 binary="$target_dir/$target/release/$package"
 expected_version="$package $version"
 reported_version=$("$binary" --version)
@@ -61,7 +58,10 @@ install -m 0644 README.md "$docs/README.md"
 gzip -9n "$docs/README.md"
 install -m 0644 LICENSE "$docs/copyright"
 install -m 0644 THIRD_PARTY_LICENSES.md "$docs/THIRD_PARTY_LICENSES.md"
-install -m 0644 "$script_dir/changelog" "$docs/changelog.Debian"
+sh "$script_dir/generate-changelog.sh" \
+    "$version" \
+    "$source_date_epoch" \
+    "${RELEASE_BASE_REF:-}" > "$docs/changelog.Debian"
 gzip -9n "$docs/changelog.Debian"
 
 install -m 0644 "$script_dir/conffiles" "$root/DEBIAN/conffiles"
@@ -83,7 +83,6 @@ chmod 0644 "$root/DEBIAN/control"
 ) > "$root/DEBIAN/md5sums"
 chmod 0644 "$root/DEBIAN/md5sums"
 
-source_date_epoch=${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct 2>/dev/null || date +%s)}
 export SOURCE_DATE_EPOCH=$source_date_epoch
 find "$root" -exec touch -h -d "@$source_date_epoch" {} +
 

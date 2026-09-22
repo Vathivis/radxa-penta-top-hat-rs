@@ -96,7 +96,14 @@ ramp_down = 5
   higher requested duty wins. A failed read retains that device's most recent
   temperature for two polling intervals. If no recent reading is available,
   the fan uses `max_duty` until the device reports a temperature or explicit
-  standby state.
+  standby state. Configured drives are queried in parallel by persistent
+  single-flight workers. Each `smartctl` command has a 15-second timeout; the
+  parallel collection window starts after dispatch and adds one second of
+  completion headroom. Collection waits check for shutdown at least every 100
+  milliseconds. A worker that outlives the collection deadline remains busy
+  instead of starting overlapping commands for that drive; its late result is
+  discarded and a fresh read starts at the next poll where the worker is idle,
+  with a full collection window. Failed worker starts are retried on later polls.
 - `[key]`: `click`, `twice`, and `press` assign actions to a single click,
   double click, and long press. Actions are `slider` (wake or next OLED page),
   `switch` (toggle fan control), `reboot`, `poweroff`, or `none`.
@@ -146,7 +153,7 @@ service. An editable example is installed at
 ```bash
 git clone https://github.com/Vathivis/radxa-penta-top-hat-rs.git
 cd radxa-penta-top-hat-rs
-cargo build --locked --release
+cargo build --release
 ```
 
 Build the installable ARM64 Debian package with:
@@ -163,10 +170,13 @@ Debian package, and checksums) with:
 sh packaging/build-release.sh
 ```
 
-GitHub Actions runs formatting, tests, Clippy, and the ARM64 package build for
-pull requests and pushes to `main`. When the version in `Cargo.toml` increases
-on `main` and matches `Cargo.lock` plus the Debian changelog, it publishes the
-four artifacts as a `v<version>` GitHub release.
+GitHub Actions runs formatting, tests, and Clippy for pull requests and pushes
+to `main`. Bump the version in `Cargo.toml` and merge to `main` to build the
+ARM64 artifacts and publish a `v<version>` GitHub release. Release notes and
+the package changelog are generated from the merged commits; no manual
+changelog or `Cargo.lock` version edit is required. Historical package changelog
+entries are reconstructed for tagged releases; untagged intermediate version
+bumps do not block packaging or create entries for unpublished releases.
 
 ## Logging and retention
 
