@@ -10,6 +10,8 @@ impl Repository {
         let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         std::fs::create_dir_all(repo.0.join("packaging/debian")).unwrap();
         for file in [
+            "packaging/read-version.sh",
+            "packaging/prepare-release-source.sh",
             "packaging/release-notes.sh",
             "packaging/debian/generate-changelog.sh",
         ] {
@@ -90,6 +92,95 @@ fn successful_output(output: Output) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).unwrap()
+}
+
+#[test]
+fn source_export_builds_keep_the_current_and_archived_changelog_entries() {
+    let repo = Repository::new();
+    repo.commit_version("1.0.4", "fix: support source exports");
+    std::fs::remove_dir_all(repo.0.join(".git")).unwrap();
+
+    let changelog = successful_output(repo.changelog("1.0.4"));
+    assert!(changelog.starts_with("radxa-penta-top-hat-rs (1.0.4)"));
+    assert!(changelog.contains("Git release history is unavailable"));
+    assert!(changelog.contains("radxa-penta-top-hat-rs (1.0.3)"));
+    assert!(changelog.contains("Archived release"));
+}
+
+#[test]
+fn manifest_only_bump_prepares_a_committed_lockfile_for_locked_consumers() {
+    let repo = Repository::new();
+    std::fs::create_dir(repo.0.join("src")).unwrap();
+    std::fs::write(repo.0.join("src/main.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(
+        repo.0.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"radxa-penta-top-hat-rs\"\nversion = \"1.0.3\"\n",
+    )
+    .unwrap();
+    repo.commit_version("1.0.3", "feat: establish archived release");
+    repo.git(&["tag", "v1.0.3"]);
+    repo.commit_version("1.0.4", "fix: prepare the next release");
+    let original = checked(
+        Command::new("git")
+            .current_dir(&repo.0)
+            .args(["rev-parse", "HEAD"]),
+    );
+    let prepared = checked(
+        Command::new("sh")
+            .current_dir(&repo.0)
+            .arg("packaging/prepare-release-source.sh")
+            .env("CARGO_NET_OFFLINE", "true")
+            .env("GIT_AUTHOR_DATE", "2020-01-01T00:00:00Z")
+            .env("GIT_COMMITTER_DATE", "2020-01-01T00:00:00Z"),
+    );
+    assert_ne!(prepared, original);
+    let changed = checked(Command::new("git").current_dir(&repo.0).args([
+        "diff",
+        "--name-only",
+        original.trim(),
+        prepared.trim(),
+    ]));
+    assert_eq!(changed.trim(), "Cargo.lock");
+    repo.git(&["tag", "v1.0.4", prepared.trim()]);
+    let lockfile = checked(
+        Command::new("git")
+            .current_dir(&repo.0)
+            .args(["show", "v1.0.4:Cargo.lock"]),
+    );
+    assert!(lockfile.contains("version = \"1.0.4\""));
+    successful_output(
+        Command::new("cargo")
+            .current_dir(&repo.0)
+            .args(["build", "--locked", "--offline"])
+            .env_remove("CARGO_TARGET_DIR")
+            .output()
+            .unwrap(),
+    );
+
+    let unchanged = checked(
+        Command::new("sh")
+            .current_dir(&repo.0)
+            .arg("packaging/prepare-release-source.sh")
+            .env("CARGO_NET_OFFLINE", "true"),
+    );
+    assert_eq!(unchanged, prepared);
+    repo.git(&["checkout", "--quiet", "--detach", original.trim()]);
+    let retried = checked(
+        Command::new("sh")
+            .current_dir(&repo.0)
+            .arg("packaging/prepare-release-source.sh")
+            .env("CARGO_NET_OFFLINE", "true")
+            .env("GIT_AUTHOR_DATE", "2021-01-01T00:00:00Z")
+            .env("GIT_COMMITTER_DATE", "2021-01-01T00:00:00Z"),
+    );
+    assert_eq!(retried, prepared);
+    let notes = checked(
+        Command::new("sh")
+            .current_dir(&repo.0)
+            .args(["packaging/release-notes.sh", "v1.0.3"]),
+    );
+    assert!(notes.contains("fix: prepare the next release"));
+    assert!(!notes.contains("synchronize release lockfile"));
 }
 
 #[test]

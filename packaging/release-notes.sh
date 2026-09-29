@@ -22,6 +22,7 @@ fi
 git log --no-merges --reverse --format=%s "$range" |
     awk '
         /^chore: bump version( to)? / { next }
+        /^chore: synchronize release lockfile$/ { next }
         NF { print "- " $0; printed = 1 }
         END { if (!printed) print "- Maintenance release" }
     '

@@ -23,7 +23,7 @@ target_dir=${CARGO_TARGET_DIR:-$repo_root/target/debian-build-v$version}
 dist_dir=${DIST_DIR:-$repo_root/dist}
 export CARGO_TARGET_DIR=$target_dir
 
-cargo build --release --target "$target"
+cargo build --locked --release --target "$target"
 binary="$target_dir/$target/release/$package"
 expected_version="$package $version"
 reported_version=$("$binary" --version)

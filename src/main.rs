@@ -314,10 +314,9 @@ fn run() -> Result<(), String> {
     let mut cpu_temp_log_state = CpuTempLogState::default();
     let mut duty_stabilizer = DutyStabilizer::default();
     let fan_enabled = Arc::new(AtomicBool::new(true));
-    let initial_decision = FanDecision::cpu_only_with_curve(
+    let initial_decision = initial_fan_decision(
         cpu_temp_log_state.read_for_fan(&args.cpu_temp_path),
-        config.fan,
-        config.fan_curve,
+        &config,
     );
     let initial_fan_percent = duty_stabilizer.force(
         initial_decision.duty_percent,
@@ -332,7 +331,7 @@ fn run() -> Result<(), String> {
         100
     };
 
-    // Establish CPU-safe output before optional OLED and button initialization.
+    // Establish safe output before optional initialization and the first SMART read.
     if let Some(output) = output.as_mut()
         && apply_changed_duty(output, initial_fan_percent, &mut last_duty_percent)?
     {
@@ -389,7 +388,7 @@ fn run() -> Result<(), String> {
     let mut drive_temperature_poller =
         drive_polling_enabled.then(|| DriveTemperaturePoller::new(&config.fan_drives.devices));
     let mut last_drive_poll = None;
-    let mut hottest_drive_temp_c = None;
+    let mut hottest_drive_temp_c = initial_decision.hottest_drive_temp_c;
     let mut drive_temperature_state = DriveTemperatureState::default();
     let mut drive_log_state = DriveLogState::default();
 
@@ -440,7 +439,7 @@ fn run() -> Result<(), String> {
         );
         fan_percent.store(commanded_duty_percent, Ordering::SeqCst);
 
-        // Establish a CPU-safe duty before the first, potentially slower, SMART batch.
+        // Apply the current safe duty before awaiting a potentially slower SMART batch.
         if let Some(output) = output.as_mut() {
             apply_changed_duty(output, commanded_duty_percent, &mut last_duty_percent)?;
             log_fan_change(
@@ -630,6 +629,18 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
+fn initial_fan_decision(cpu_temp_c: f64, config: &Config) -> FanDecision {
+    let drive_temp =
+        (config.fan_drives.enabled && !config.fan_drives.devices.is_empty()).then_some(f64::NAN);
+    FanDecision::from_temperatures_with_curve(
+        cpu_temp_c,
+        config.fan,
+        drive_temp,
+        config.fan_drives.thresholds,
+        config.fan_curve,
+    )
+}
+
 fn commanded_duty(
     decision: &FanDecision,
     enabled: bool,
@@ -811,6 +822,28 @@ mod tests {
         assert!(validate_test_fan_duty(80, curve).is_ok());
         assert!(validate_test_fan_duty(81, curve).is_err());
         assert!(validate_test_fan_duty(100, FanCurveConfig::default()).is_ok());
+    }
+
+    #[test]
+    fn startup_uses_drive_fail_safe_until_telemetry_is_available() {
+        let mut config = Config::default();
+        config.fan_drives.enabled = true;
+        config.fan_drives.devices = vec!["/dev/sdc".to_string()];
+        config.fan_curve.enabled = true;
+        config.fan_curve.max_duty = 80;
+
+        let initial = initial_fan_decision(40.0, &config);
+        assert!(initial.hottest_drive_temp_c.unwrap().is_nan());
+        assert_eq!(initial.duty_percent, 80);
+
+        config.fan_curve.enabled = false;
+        assert_eq!(initial_fan_decision(40.0, &config).duty_percent, 100);
+
+        config.fan_drives.enabled = false;
+        assert_eq!(initial_fan_decision(40.0, &config).duty_percent, 0);
+        config.fan_drives.enabled = true;
+        config.fan_drives.devices.clear();
+        assert_eq!(initial_fan_decision(40.0, &config).duty_percent, 0);
     }
 
     #[test]

@@ -23,11 +23,41 @@ if [ "$archived_version" = "$version" ]; then
     exit 0
 fi
 
+git_history_available=false
+git_root=$(git rev-parse --show-toplevel 2>/dev/null || true)
+if [ "$git_root" = "$repo_root" ] && git rev-parse --verify HEAD >/dev/null 2>&1; then
+    git_history_available=true
+fi
+
+write_entry() {
+    entry_version=$1
+    base_ref=$2
+    head_ref=$3
+    entry_epoch=$4
+
+    printf '%s (%s) stable; urgency=medium\n\n' "$package" "$entry_version"
+    if [ "$git_history_available" = true ]; then
+        sh "$release_notes" "$base_ref" "$head_ref" | sed 's/^- /  * /'
+    else
+        printf '  * Build from exported sources; Git release history is unavailable.\n'
+    fi
+    printf '\n -- Vathivis <vojtahumpl@seznam.cz>  %s\n' \
+        "$(date -u -R -d "@$entry_epoch")"
+}
+
+if [ "$git_history_available" = false ]; then
+    write_entry "$version" "" HEAD "$source_date_epoch"
+    printf '\n'
+    sed -n '1,$p' "$archive"
+    exit 0
+fi
+
 temporary=$(mktemp -d "${TMPDIR:-/tmp}/radxa-penta-changelog.XXXXXX")
 trap 'rm -rf "$temporary"' 0 1 2 15
 history="$temporary/version-history"
 intermediate="$temporary/intermediate-releases"
 intermediate_desc="$temporary/intermediate-releases-desc"
+: > "$history"
 
 previous_version=
 for commit in $(git rev-list --first-parent --reverse HEAD -- Cargo.toml); do
@@ -41,18 +71,6 @@ for commit in $(git rev-list --first-parent --reverse HEAD -- Cargo.toml); do
         previous_version=$commit_version
     fi
 done
-
-write_entry() {
-    entry_version=$1
-    base_ref=$2
-    head_ref=$3
-    entry_epoch=$4
-
-    printf '%s (%s) stable; urgency=medium\n\n' "$package" "$entry_version"
-    sh "$release_notes" "$base_ref" "$head_ref" | sed 's/^- /  * /'
-    printf '\n -- Vathivis <vojtahumpl@seznam.cz>  %s\n' \
-        "$(date -u -R -d "@$entry_epoch")"
-}
 
 # Walk forward so skipped, unpublished bumps remain in the next release's
 # commit range instead of becoming artificial changelog boundaries.

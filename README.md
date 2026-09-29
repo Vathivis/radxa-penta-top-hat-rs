@@ -97,7 +97,8 @@ ramp_down = 5
   temperature for two polling intervals. If no recent reading is available,
   the fan uses `max_duty` until the device reports a temperature or explicit
   standby state. Configured drives are queried in parallel by persistent
-  single-flight workers. Each `smartctl` command has a 15-second timeout; the
+  single-flight workers. Startup also uses `max_duty` until the first readings
+  or standby results arrive. Each `smartctl` command has a 15-second timeout; the
   parallel collection window starts after dispatch and adds one second of
   completion headroom. Collection waits check for shutdown at least every 100
   milliseconds. A worker that outlives the collection deadline remains busy
@@ -174,9 +175,13 @@ GitHub Actions runs formatting, tests, and Clippy for pull requests and pushes
 to `main`. Bump the version in `Cargo.toml` and merge to `main` to build the
 ARM64 artifacts and publish a `v<version>` GitHub release. Release notes and
 the package changelog are generated from the merged commits; no manual
-changelog or `Cargo.lock` version edit is required. Historical package changelog
+changelog or `Cargo.lock` version edit is required. On a version bump, CI
+synchronizes and commits `Cargo.lock` on `main`, then builds with `--locked` and
+tags that prepared source commit. Historical package changelog
 entries are reconstructed for tagged releases; untagged intermediate version
-bumps do not block packaging or create entries for unpublished releases.
+bumps do not block packaging or create entries for unpublished releases. Source
+exports without Git metadata use a current-version entry plus the archived
+changelog, since the intervening release history is unavailable.
 
 ## Logging and retention
 
