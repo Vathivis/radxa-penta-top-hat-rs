@@ -87,9 +87,11 @@ jobs:
             fi
             should_release=true
 
-            previous_tag="v${previous_version}"
-            if git merge-base --is-ancestor "$previous_tag" HEAD 2>/dev/null; then
-              base_ref="$previous_tag"
+            # A previous version may have reached main without being released.
+            # Include its commits by starting at the last reachable release tag.
+            latest_tag=$(git describe --tags --abbrev=0 --match 'v[0-9]*' "$BEFORE_SHA" 2>/dev/null || true)
+            if [[ -n "$latest_tag" ]]; then
+              base_ref="$latest_tag"
             fi
           fi
 

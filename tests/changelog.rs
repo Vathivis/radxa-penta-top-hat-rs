@@ -58,6 +58,19 @@ impl Repository {
             .output()
             .unwrap()
     }
+
+    fn changelog_from(&self, version: &str, base: &str) -> Output {
+        Command::new("sh")
+            .current_dir(&self.0)
+            .args([
+                "packaging/debian/generate-changelog.sh",
+                version,
+                "1790035200",
+                base,
+            ])
+            .output()
+            .unwrap()
+    }
 }
 
 impl Drop for Repository {
@@ -94,6 +107,28 @@ fn unpublished_version_bumps_do_not_block_later_release_history() {
     assert!(!current.contains("radxa-penta-top-hat-rs (1.0.4)"));
     assert!(current.contains("fix: retain an unpublished change"));
     assert!(current.contains("fix: complete the next release"));
+
+    // The workflow looks for the latest tag reachable from the prior main
+    // commit. Pass that explicit base through both release output paths.
+    let base = checked(Command::new("git").current_dir(&repo.0).args([
+        "describe",
+        "--tags",
+        "--abbrev=0",
+        "--match",
+        "v[0-9]*",
+        "HEAD^",
+    ]));
+    assert_eq!(base.trim(), "v1.0.3");
+    let notes = checked(
+        Command::new("sh")
+            .current_dir(&repo.0)
+            .args(["packaging/release-notes.sh", base.trim()]),
+    );
+    let package_changelog = successful_output(repo.changelog_from("1.0.5", base.trim()));
+    for output in [&notes, &package_changelog] {
+        assert!(output.contains("fix: retain an unpublished change"));
+        assert!(output.contains("fix: complete the next release"));
+    }
 
     repo.git(&["tag", "v1.0.5"]);
     repo.commit_version("1.0.6", "fix: add a later release change");
