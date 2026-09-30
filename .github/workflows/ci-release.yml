@@ -40,7 +40,7 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
   release_info:
-    name: Detect version bump on main
+    name: Detect unpublished version on main
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: validate
     runs-on: ubuntu-24.04
@@ -57,50 +57,14 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Compare Cargo.toml with previous main commit
+      - name: Detect pending release from version and tags
         id: version
         shell: bash
         env:
           BEFORE_SHA: ${{ github.event.before }}
         run: |
           set -euo pipefail
-
-          version=$(sh packaging/read-version.sh)
-          should_release=false
-          if [[ -z "$BEFORE_SHA" || "$BEFORE_SHA" =~ ^0+$ ]]; then
-            echo "::error::Cannot determine the previous main-branch revision"
-            exit 1
-          fi
-
-          previous_version=$(
-            git show "${BEFORE_SHA}:Cargo.toml" |
-              sed -n 's/^version = "\([^"]*\)"/\1/p' |
-              sed -n '1p'
-          )
-          if [[ -z "$previous_version" ]]; then
-            echo "::error::Cannot read the package version at $BEFORE_SHA"
-            exit 1
-          fi
-
-          base_ref="$BEFORE_SHA"
-          if [[ "$version" != "$previous_version" ]]; then
-            if ! dpkg --compare-versions "$version" gt "$previous_version"; then
-              echo "::error::Version changed from $previous_version to $version, but it was not increased"
-              exit 1
-            fi
-            should_release=true
-
-            # A previous version may have reached main without being released.
-            # Include its commits by starting at the last reachable release tag.
-            latest_tag=$(git describe --tags --abbrev=0 --match 'v[0-9]*' "$BEFORE_SHA" 2>/dev/null || true)
-            if [[ -n "$latest_tag" ]]; then
-              base_ref="$latest_tag"
-            fi
-          fi
-
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "should_release=$should_release" >> "$GITHUB_OUTPUT"
-          echo "base_ref=$base_ref" >> "$GITHUB_OUTPUT"
+          sh packaging/detect-release.sh "$BEFORE_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust for release source preparation
         if: steps.version.outputs.should_release == 'true'

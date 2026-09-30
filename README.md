@@ -171,18 +171,6 @@ Debian package, and checksums) with:
 sh packaging/build-release.sh
 ```
 
-GitHub Actions runs formatting, tests, and Clippy for pull requests and pushes
-to `main`. Bump the version in `Cargo.toml` and merge to `main` to build the
-ARM64 artifacts and publish a `v<version>` GitHub release. Release notes and
-the package changelog are generated from the merged commits; no manual
-changelog or `Cargo.lock` version edit is required. On a version bump, CI
-synchronizes and commits `Cargo.lock` on `main`, then builds with `--locked` and
-tags that prepared source commit. Historical package changelog
-entries are reconstructed for tagged releases; untagged intermediate version
-bumps do not block packaging or create entries for unpublished releases. Source
-exports without Git metadata use a current-version entry plus the archived
-changelog, since the intervening release history is unavailable.
-
 ## Logging and retention
 
 The direct-run daemon writes diagnostics to standard output and standard error.

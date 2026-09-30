@@ -11,6 +11,7 @@ impl Repository {
         std::fs::create_dir_all(repo.0.join("packaging/debian")).unwrap();
         for file in [
             "packaging/read-version.sh",
+            "packaging/detect-release.sh",
             "packaging/prepare-release-source.sh",
             "packaging/release-notes.sh",
             "packaging/debian/generate-changelog.sh",
@@ -92,6 +93,48 @@ fn successful_output(output: Output) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).unwrap()
+}
+
+#[test]
+fn unpublished_version_is_retried_after_a_same_version_merge() {
+    let repo = Repository::new();
+    repo.commit_version("1.0.3", "feat: establish archived release");
+    repo.git(&["tag", "v1.0.3"]);
+    repo.commit_version("1.0.4", "chore: bump version to 1.0.4");
+    let before = checked(
+        Command::new("git")
+            .current_dir(&repo.0)
+            .args(["rev-parse", "HEAD"]),
+    );
+    let detect = |before: &str| {
+        checked(
+            Command::new("sh")
+                .current_dir(&repo.0)
+                .args(["packaging/detect-release.sh", before]),
+        )
+    };
+    assert!(detect("HEAD^").contains("should_release=true\n"));
+
+    // An intervening merge rejects the earlier workflow's lockfile push.
+    // Its own workflow must retry publication despite an unchanged version.
+    std::fs::write(
+        repo.0.join("README.md"),
+        "Intervening documentation change\n",
+    )
+    .unwrap();
+    repo.commit_version("1.0.4", "docs: update the documentation");
+    let pending = detect(before.trim());
+    assert!(pending.contains("version=1.0.4\n"));
+    assert!(pending.contains("should_release=true\n"));
+    assert!(pending.contains("base_ref=v1.0.3\n"));
+
+    // Once published, same-version pushes must not publish another release.
+    repo.git(&["tag", "v1.0.4"]);
+    assert!(detect(before.trim()).contains("should_release=false\n"));
+    repo.commit_version("1.0.5", "chore: bump version to 1.0.5");
+    let next_release = detect("HEAD^");
+    assert!(next_release.contains("should_release=true\n"));
+    assert!(next_release.contains("base_ref=v1.0.4\n"));
 }
 
 #[test]
